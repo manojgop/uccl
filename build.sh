@@ -268,9 +268,9 @@ if [[ -n "${BASE_IMAGE:-}" ]]; then
   BUILD_ARGS+=" --build-arg BASE_IMAGE=${BASE_IMAGE}"
 fi
 if [[ "$ARCH" == "aarch64" ]]; then
-  docker build --platform=linux/arm64 $BUILD_ARGS -t "$IMAGE_NAME" -f "$DOCKERFILE" .
+  podman build --platform=linux/arm64 $BUILD_ARGS -t "$IMAGE_NAME" -f "$DOCKERFILE" .
 else
-  docker build $BUILD_ARGS -t "$IMAGE_NAME" -f "$DOCKERFILE" .
+  podman build $BUILD_ARGS -t "$IMAGE_NAME" -f "$DOCKERFILE" .
 fi
 
 echo "[2/3] Running build inside container..."
@@ -312,7 +312,7 @@ fi
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-${DETECTED_GPU_ARCH}}"
 
-docker run --rm --user "$(id -u):$(id -g)" \
+podman run --rm --user root \
   -v /etc/passwd:/etc/passwd:ro \
   -v /etc/group:/etc/group:ro \
   -v $HOME:$HOME \
