@@ -18,7 +18,10 @@ ARCH_SUFFIX=$(uname -m)
 pip install -r requirements.txt
 pip uninstall uccl -y || true
 if [[ $TARGET != "therock" ]]; then
-  pip install wheelhouse-$TARGET/uccl-*.whl --no-deps
+  echo "WORKAROUND: NOT RECOMMENDED : Rename wheel file to match 2_34 glibc in Rocky Linux 9.4 system" >&2
+  cp wheelhouse-$TARGET/uccl-0.0.1.post4-py3-none-manylinux_2_35_x86_64.whl wheelhouse-$TARGET/uccl-0.0.1.post4-py3-none-manylinux_2_34_x86_64.whl
+  pip install wheelhouse-$TARGET/uccl-0.0.1.post4-py3-none-manylinux_2_34_x86_64.whl --no-deps
+  #pip install wheelhouse-$TARGET/uccl-*.whl --no-deps
 else
   # TheRock packages ROCm dependences through python packaging
   # That (currently) requires --extra-index-url
