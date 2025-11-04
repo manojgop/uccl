@@ -13,7 +13,7 @@ HOSTFILE="${UCCL_HOME}/scripts/node_ips/test.txt"
 #HOSTFILE="${UCCL_HOME}/scripts/node_ips/h100_6.txt"
 
 # Names of HCAs.
-HCA_NAMES="irdma-mkp0:1"
+HCA_NAMES="irdma-mkp0:1,irdma-mkp1:1"
 #HCA_NAMES="mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1"
 # Name of Control NIC.
 CTRL_NIC="eno0"
@@ -81,7 +81,7 @@ mpirun --allow-run-as-root -np ${NUM_PROCS} -N ${PROCS_PER_NODE} \
     -x NCCL_IB_DISABLE=0  \
     -hostfile ${HOSTFILE} --map-by ppr:${PROCS_PER_NODE}:node \
     -x NCCL_DEBUG=WARN \
-    -x NCCL_IB_HCA=irdma-mkp0 \
+    -x NCCL_IB_HCA=${HCA_NAMES} \
     -x NCCL_IB_QPS_PER_CONNECTION=${NUM_QPS_PER_CONNECTION} -x NCCL_IB_SPLIT_DATA_ON_QPS=${SPLIT_DATA_ON_QPS} \
     -x NCCL_IB_PCI_RELAXED_ORDERING=1 \
     -x NCCL_P2P_DISABLE=${NVLINK_OFF} \
