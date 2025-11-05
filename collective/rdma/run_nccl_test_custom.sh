@@ -101,6 +101,8 @@ mpirun --allow-run-as-root -np ${NUM_PROCS} -N ${PROCS_PER_NODE} \
     -x NCCL_IB_MERGE_NICS=0 \
     -x NCCL_NVLS_ENABLE=0 \
     -x NCCL_NET_PLUGIN=${PLUGIN_PATH} \
+    -x GLOG_v=0 \
+    -x UCCL_DEBUG=WARN \
     --mca btl tcp,self \
     --mca btl_tcp_if_include ${CTRL_NIC} \
     ./set_gid_index.sh ${UCCL_HOME}/thirdparty/nccl-tests/build/${PROG_NAME} -c 0 \
