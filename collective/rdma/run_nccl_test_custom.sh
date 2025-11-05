@@ -13,6 +13,7 @@ HOSTFILE="${UCCL_HOME}/scripts/node_ips/test.txt"
 #HOSTFILE="${UCCL_HOME}/scripts/node_ips/h100_6.txt"
 
 # Names of HCAs.
+#HCA_NAMES="irdma-cvl01:1"
 HCA_NAMES="irdma-mkp0:1,irdma-mkp1:1"
 #HCA_NAMES="mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1"
 # Name of Control NIC.
@@ -103,6 +104,8 @@ mpirun --allow-run-as-root -np ${NUM_PROCS} -N ${PROCS_PER_NODE} \
     -x NCCL_NET_PLUGIN=${PLUGIN_PATH} \
     -x GLOG_v=0 \
     -x UCCL_DEBUG=WARN \
+    -x UCCL_PORT_ENTROPY=256 \
+    -x UCCL_NUM_ENGINES=4 \
     --mca btl tcp,self \
     --mca btl_tcp_if_include ${CTRL_NIC} \
     ./set_gid_index.sh ${UCCL_HOME}/thirdparty/nccl-tests/build/${PROG_NAME} -c 0 \
