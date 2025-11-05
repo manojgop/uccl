@@ -299,7 +299,6 @@ static inline struct ibv_cq_ex* util_rdma_create_cq_ex(
   if constexpr (kEnableCQIgnoreOverrun) {
     cq_ex_attr.flags |= IBV_CREATE_CQ_ATTR_IGNORE_OVERRUN;
   }
-
   if constexpr (kTestNoHWTimestamp)
     cq_ex_attr.wc_flags &= ~IBV_WC_EX_WITH_COMPLETION_TIMESTAMP;
 
@@ -319,7 +318,8 @@ static inline int util_rdma_modify_cq_attr(struct ibv_cq_ex* cq_ex,
   cq_attr.moderate.cq_count = cq_count;
   cq_attr.moderate.cq_period = cq_period;
 
-  return ibv_modify_cq(ibv_cq_ex_to_cq(cq_ex), &cq_attr);
+  //return ibv_modify_cq(ibv_cq_ex_to_cq(cq_ex), &cq_attr);
+  return 0;
 }
 
 /**
