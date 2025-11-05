@@ -232,20 +232,20 @@ fi
 
 # Detect stale builder image
 # If a builder image exists...
-hash_image=$(docker images -q ${IMAGE_NAME})
+hash_image=$(podman images -q ${IMAGE_NAME})
 if [[ "${hash_image}" != "" ]]; then
 
   # Get its and its dockerfile's timestamps
   ts_dockerfile=$(date -r ${DOCKERFILE} --iso-8601=seconds)
-  ts_image=$(docker inspect -f '{{ .Created }}' ${IMAGE_NAME})
+  ts_image=$(podman inspect -f '{{ .Created }}' ${IMAGE_NAME})
 
   # If image is stale, suggest deleting & purging it
   if [[ "${ts_dockerfile}" > "${ts_image}" ]]; then
       echo "WARNING: builder image '${IMAGE_NAME}' is older than its source (${DOCKERFILE})" >&2
       echo "Please consider removing it, pruning the builder cache, and retrying the build to regenerate it." >&2
       echo " " >&2
-      echo "  $ docker image rm '${IMAGE_NAME}'" >&2
-      echo "  $ docker buildx prune -f" >&2
+      echo "  $ podman image rm '${IMAGE_NAME}'" >&2
+      echo "  $ podman buildx prune -f" >&2
       echo " " >&2
       echo "NOTE: this may also prune unrelated builder cache images!" >&2
       sleep 1
