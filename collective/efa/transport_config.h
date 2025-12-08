@@ -31,8 +31,13 @@ static_assert(
     "kSenderCCType and kReceiverCCType can not be kNone at the same time.");
 
 #define P4D
+#define INTEL_RDMA_NIC
 
+#ifdef INTEL_RDMA_NIC
+static const uint32_t kNumVdevices = 1;        // # of vEFA/GPUs.
+#else
 static const uint32_t kNumVdevices = 8;        // # of vEFA/GPUs.
+#endif
 static const uint32_t kNumEnginesPerVdev = 2;  // # of engines per vEFA/GPU.
 static const uint32_t kNumEngines = kNumVdevices * kNumEnginesPerVdev;
 static bool const kSplitSendRecvEngine =
@@ -41,13 +46,21 @@ static bool const kSplitSendRecvEngine =
 /// Interface configuration.
 #ifdef P4D
 static const uint8_t NUM_DEVICES = (kNumVdevices + 1) / 2;
+#ifdef INTEL_RDMA_NIC
+static const uint8_t EFA_GID_IDX = 2;
+#else
 static const uint8_t EFA_GID_IDX = 0;
-
+#endif
 static constexpr double kLinkBandwidth = 100.0 * 1e9 / 8;  // 100Gbps
 #endif
 static const uint8_t EFA_PORT_NUM = 1;  // The port of EFA device to use.
+#ifdef INTEL_RDMA_NIC
+static const uint32_t EFA_MTU = 4096;  // Max frame on fabric, includng headers.
+static const uint32_t EFA_MAX_PAYLOAD = 4056;  // this excludes EFA_UD_ADDITION.
+#else
 static const uint32_t EFA_MTU = 9000;  // Max frame on fabric, includng headers.
 static const uint32_t EFA_MAX_PAYLOAD = 8928;  // this excludes EFA_UD_ADDITION.
+#endif
 static const uint32_t EFA_HDR_OVERHEAD = EFA_MTU - EFA_MAX_PAYLOAD;
 static const uint32_t EFA_MAX_QPS = 256;         // Max QPs per EFA device.
 static const uint32_t EFA_MAX_INLINE_SIZE = 32;  // Max inline data size.
@@ -70,6 +83,7 @@ static const uint32_t ENGINE_CPU_START[2] = {NUM_CPUS / 2, NUM_CPUS / 4};
 static const uint32_t PACER_CPU_START[2] = {
     ENGINE_CPU_START[0] + 8 /* 4 VDEV * 2 EnginePerVdev */,
     ENGINE_CPU_START[1] + 8 /* 4 VDEV * 2 EnginePerVdev */};
+
 static const uint16_t BASE_PORT = 10000;
 static const uint64_t NUM_FRAMES = 4 * 65536;  // # of frames.
 static const uint32_t RECV_BATCH_SIZE = 32;
