@@ -335,6 +335,7 @@ class EFASocket {
   PktDataBuffPool* pkt_data_pool_;
   FrameDescBuffPool* frame_desc_pool_;
 
+
   // For fast CQ polling.
   struct ibv_wc wc_[kMaxPollBatch];
 
