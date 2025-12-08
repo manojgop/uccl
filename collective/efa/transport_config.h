@@ -38,7 +38,15 @@ static_assert(
 #define MANAGED
 #endif
 
+#ifdef INTEL_RDMA_NIC
+#define MANAGED
+#endif
+
+#ifdef INTEL_RDMA_NIC
+static const uint32_t kNumVdevices = 1;        // # of vEFA/GPUs.
+#else
 static const uint32_t kNumVdevices = 8;        // # of vEFA/GPUs.
+#endif
 static const uint32_t kNumEnginesPerVdev = 2;  // # of engines per vEFA/GPU.
 static const uint32_t kNumEngines = kNumVdevices * kNumEnginesPerVdev;
 static bool const kSplitSendRecvEngine =
@@ -85,6 +93,7 @@ static const uint32_t ENGINE_CPU_START[2] = {NUM_CPUS / 2, NUM_CPUS / 4};
 static const uint32_t PACER_CPU_START[2] = {
     ENGINE_CPU_START[0] + 8 /* 4 VDEV * 2 EnginePerVdev */,
     ENGINE_CPU_START[1] + 8 /* 4 VDEV * 2 EnginePerVdev */};
+
 static const uint16_t BASE_PORT = 10000;
 static const uint64_t NUM_FRAMES = 4 * 65536;  // # of frames.
 #ifdef INTEL_RDMA_NIC
