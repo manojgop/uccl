@@ -220,8 +220,14 @@ void UcclRDMAEngine::uc_handle_completion(void) {
       work += it.second->poll_credit_cq();
   }
 
-  io_ctx_.uc_poll_send_cq();
-  io_ctx_.uc_poll_recv_cq();
+  // Use UD or UC poll functions based on mode
+  if (io_ctx_.is_ud_for_data()) {
+    io_ctx_.ud_poll_send_cq();
+    io_ctx_.ud_poll_recv_cq();
+  } else {
+    io_ctx_.uc_poll_send_cq();
+    io_ctx_.uc_poll_recv_cq();
+  }
 
   for (auto& it : rdma_ctx_map_) {
     if constexpr (kReceiverCCA == RECEIVER_CCA_EQDS)
@@ -396,6 +402,11 @@ void UcclRDMAEngine::handle_tx_work(void) {
       continue;
     }
     UCCL_LOG_ENGINE << "Process tx work.";
+    static std::atomic<uint64_t> tx_msg_count{0};
+    auto count = tx_msg_count.fetch_add(1);
+    if (count % 100 == 0) {
+      UCCL_LOG_ENGINE << "TX MESSAGE dispatch: count=" << count << " type=" << ureq->type;
+    }
     if (!rdma_ctx->tx_message(ureq)) {
       pending_tx_works_.push_back(std::make_pair(rdma_ctx, ureq));
     }
@@ -645,8 +656,10 @@ void UcclRDMAEngine::handle_install_ctx_on_engine(Channel::CtrlMsg& ctrl_work) {
     next_install_engine->store(next_install_engine->load() + 1);
 
     // Modify QPs to RTR and RTS.
+    rdma_ctx->remote_ctx_.remote_qpns.resize(ucclParamPORT_ENTROPY());
     for (auto i = 0; i < ucclParamPORT_ENTROPY(); i++) {
       auto remote_qpn = *reinterpret_cast<uint32_t*>(buf + i * size);
+      rdma_ctx->remote_ctx_.remote_qpns[i] = remote_qpn;  // Store for UD
       auto qp = rdma_ctx->dp_qps_[i].qp;
 
       ret = modify_qp_rtr(qp, dev, &rdma_ctx->remote_ctx_, remote_qpn);
@@ -1895,6 +1908,7 @@ RDMAContext::RDMAContext(TimerManager* rto, uint32_t* engine_unacked_bytes,
 
   port_entropy_ = ucclParamPORT_ENTROPY();
   dp_qps_.resize(port_entropy_);
+
   chunk_size_ = (ucclParamCHUNK_SIZE_KB() << 10);
 
   link_speed_ = util_rdma_get_link_speed_from_ibv_speed(
@@ -1910,18 +1924,40 @@ RDMAContext::RDMAContext(TimerManager* rto, uint32_t* engine_unacked_bytes,
   mtu_bytes_ =
       util_rdma_get_mtu_from_ibv_mtu(factory_dev->port_attr.active_mtu);
 
+  // For UD mode, cap chunk size to MTU - UD_ADDITION (GRH overhead)
+  // UD has max message size = MTU - GRH (40 bytes)
+  if (io_ctx->is_ud_for_data()) {
+    uint32_t ud_max_size = mtu_bytes_ - UD_ADDITION;
+    if (chunk_size_ > ud_max_size) {
+      LOG(WARNING) << "UD mode: Reducing chunk size from " << chunk_size_
+                   << " to " << ud_max_size << " bytes (MTU=" << mtu_bytes_
+                   << ", GRH=" << UD_ADDITION << ")";
+      chunk_size_ = ud_max_size;
+    }
+  }
+
   pd_ = factory_dev->pd;
 
-  // Create data path QPs. (UC/RC)
+  // Create data path QPs. (UC/RC/UD)
   struct ibv_qp_init_attr qp_init_attr;
   memset(&qp_init_attr, 0, sizeof(qp_init_attr));
   qp_init_attr.qp_context = this;
   qp_init_attr.send_cq = ibv_cq_ex_to_cq(io_ctx->send_cq_ex_);
   qp_init_attr.recv_cq = ibv_cq_ex_to_cq(io_ctx->recv_cq_ex_);
-  if (!rc_mode())
+
+  // Set QP type based on mode
+  if (io_ctx->is_ud_for_data())
+    qp_init_attr.qp_type = IBV_QPT_UD;
+  else if (!rc_mode())
     qp_init_attr.qp_type = IBV_QPT_UC;
   else
     qp_init_attr.qp_type = IBV_QPT_RC;
+
+  UCCL_LOG_ENGINE << "Creating " << ucclParamPORT_ENTROPY() << " QPs of type " 
+            << (qp_init_attr.qp_type == IBV_QPT_UD ? "UD" : 
+                qp_init_attr.qp_type == IBV_QPT_UC ? "UC" : "RC")
+            << " for data path";
+
   qp_init_attr.cap.max_send_wr = 2 * kMaxReq * kMaxRecv;
   qp_init_attr.cap.max_send_sge = kMaxSge;
   qp_init_attr.cap.max_inline_data = 0;
@@ -1932,18 +1968,40 @@ RDMAContext::RDMAContext(TimerManager* rto, uint32_t* engine_unacked_bytes,
   qpAttr.qp_state = IBV_QPS_INIT;
   qpAttr.pkey_index = 0;
   qpAttr.port_num = factory_dev->ib_port_num;
-  qpAttr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+
+  // For UD, we don't need RDMA access flags (no RDMA operations)
+  if (!io_ctx->is_ud_for_data()) {
+    qpAttr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+  }
   qpAttr.max_rd_atomic = 8;
   qpAttr.max_dest_rd_atomic = 8;
+
+  // For UD QPs, set Q_Key
+  if (io_ctx->is_ud_for_data()) {
+    qpAttr.qkey = QKEY;
+  }
 
   for (int i = 0; i < ucclParamPORT_ENTROPY(); i++) {
     struct ibv_qp* qp = ibv_create_qp(pd_, &qp_init_attr);
     UCCL_INIT_CHECK(qp != nullptr, "ibv_create_qp failed for data path QP");
 
+    // Debug: Verify QP CQ assignments
+    if (io_ctx->is_ud_for_data()) {
+      LOG(INFO) << "UD QP " << qp->qp_num << " created: send_cq=" << (void*)qp->send_cq
+                << ", recv_cq=" << (void*)qp->recv_cq
+                << " (expected send=" << (void*)qp_init_attr.send_cq
+                << ", recv=" << (void*)qp_init_attr.recv_cq << ")";
+    }
+
     // Modify QP state to INIT.
-    UCCL_INIT_CHECK(ibv_modify_qp(qp, &qpAttr,
-                                  IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-                                      IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0,
+    int qp_flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT;
+    if (io_ctx->is_ud_for_data()) {
+      qp_flags |= IBV_QP_QKEY;  // UD requires Q_KEY
+    } else {
+      qp_flags |= IBV_QP_ACCESS_FLAGS;  // RC/UC need access flags
+    }
+
+    UCCL_INIT_CHECK(ibv_modify_qp(qp, &qpAttr, qp_flags) == 0,
                     "ibv_modify_qp failed");
 
     dp_qps_[i].qp = qp;
@@ -2563,6 +2621,264 @@ bool RDMAContext::senderCC_tx_read(struct ucclRequest* ureq) {
   return true;
 }
 
+// UD-specific TX functions (using SEND instead of RDMA WRITE/READ)
+bool RDMAContext::ud_senderCC_tx_write(struct ucclRequest* ureq) {
+  static std::atomic<uint64_t> ud_tx_entry{0};
+  auto entry_count = ud_tx_entry.fetch_add(1);
+  if (entry_count % 10 == 0) {
+    LOG(INFO) << "UD TX ENTRY: ud_senderCC_tx_write called " << entry_count << " times";
+  }
+  
+  // UD doesn't support RDMA_WRITE, so use SEND_WITH_IMM instead
+  auto* flow = reinterpret_cast<UcclFlow*>(ureq->context);
+  auto* subflow = flow->sub_flows_[engine_offset_];
+
+  auto size = ureq->send.data_len;
+  auto laddr = ureq->send.laddr;
+  auto lkey = ureq->send.lkey;
+  auto rid = ureq->send.rid;
+  uint32_t* sent_offset = &ureq->send.sent_offset;
+  uint64_t wr_addr;
+  uint32_t chunk_size;
+
+  while (*sent_offset < size || size == 0) {
+    chunk_size = EventOnChunkSize(subflow, size - *sent_offset);
+
+    if (chunk_size == 0 && size) {
+      static std::atomic<uint64_t> no_credit_count{0};
+      auto count = no_credit_count.fetch_add(1);
+      if (count % 100 == 0) {
+        LOG(INFO) << "UD TX: EventOnChunkSize returned 0 (no credits): " << count << " times";
+      }
+      return false;
+    }
+
+    CHECK_EQ(wr_ex_pool_->alloc_buff(&wr_addr), 0);
+    struct wr_ex* wr_ex = reinterpret_cast<struct wr_ex*>(wr_addr);
+    auto* wr = &wr_ex->wr;
+
+    wr_ex->sge.addr = laddr + *sent_offset;
+    wr_ex->sge.lkey = lkey;
+    wr_ex->sge.length = chunk_size;
+    wr_ex->dest_offset = *sent_offset;  // Track destination offset for UD retransmission
+
+    // UD uses SEND_WITH_IMM instead of RDMA_WRITE_WITH_IMM
+    wr->opcode = IBV_WR_SEND_WITH_IMM;
+    wr->sg_list = &wr_ex->sge;
+    wr->num_sge = 1;
+    wr->send_flags = IBV_SEND_SIGNALED;
+    wr->next = nullptr;  // Critical: terminate work request chain
+    
+    // Set wr_id for completion tracking (required for CQ polling)
+    auto* cqe_desc = io_ctx_->pop_cqe_desc();
+    cqe_desc->data = (uint64_t)wr_ex;  // Store wr_ex for later cleanup
+    cqe_desc->type = 0;  // Normal send (not retransmission)
+    wr->wr_id = (uint64_t)cqe_desc;
+
+    // hint=1 indicates last chunk of message (receiver knows message is
+    // complete) hint=0 indicates more chunks are coming
+    int hint = 0;
+    if (*sent_offset + chunk_size == size) {
+      hint = 1;
+    }
+
+    auto csn = subflow->pcb.get_snd_nxt();
+    IMMData imm_data;
+    imm_data.SetFID(subflow->fid_);
+    imm_data.SetRID(rid);
+    imm_data.SetCSN(csn.to_uint32());
+    imm_data.SetHINT(hint);
+    wr->imm_data = htonl(imm_data.GetImmData());
+
+    uint32_t qpidx = EventOnSelectPath(subflow, chunk_size);
+    auto& qpw = dp_qps_[qpidx];
+    wr_ex->qpidx = qpidx;
+
+    // Set UD addressing
+    wr->wr.ud.ah = remote_ctx_.dest_ah;
+    wr->wr.ud.remote_qpn = remote_ctx_.remote_qpns[qpidx];
+    wr->wr.ud.remote_qkey = QKEY;
+    
+    static std::atomic<bool> logged_addressing{false};
+    if (!logged_addressing.exchange(true)) {
+      LOG(INFO) << "UD addressing: AH=" << (void*)remote_ctx_.dest_ah 
+                << ", remote_qpn[" << qpidx << "]=" << remote_ctx_.remote_qpns[qpidx]
+                << ", qkey=" << QKEY << ", local QP state=" << qpw.qp->state;
+    }
+
+    auto now = rdtsc();
+    bool queued = EventOnQueueData(subflow, wr_ex, chunk_size, now);
+    
+    if (queued) {
+      // Queued on timing wheel - will be sent later
+      subflow->in_wheel_cnt_++;
+      wr_ex->ureq = ureq;
+      UCCL_LOG_IO << "UD: Queued " << chunk_size << " bytes to timing wheel";
+      
+      *sent_offset += chunk_size;
+      if (size == 0) break;
+      continue;  // Don't post send now, wheel will do it later
+    }
+    
+    // Not queued - send immediately
+    struct ibv_send_wr* bad_wr;
+    
+    // DIAGNOSTIC: Verify QP CQs haven't changed
+    static std::atomic<int> send_count{0};
+    if (send_count.fetch_add(1) < 3) {
+      struct ibv_qp_attr qp_attr;
+      struct ibv_qp_init_attr init_attr;
+      if (ibv_query_qp(qpw.qp, &qp_attr, IBV_QP_STATE, &init_attr) == 0) {
+        LOG(INFO) << "UD ibv_post_send VERIFICATION: QP=" << qpw.qp->qp_num 
+                  << ", qp->send_cq=" << (void*)qpw.qp->send_cq
+                  << ", qp->recv_cq=" << (void*)qpw.qp->recv_cq
+                  << ", init_attr.send_cq=" << (void*)init_attr.send_cq
+                  << ", init_attr.recv_cq=" << (void*)init_attr.recv_cq
+                  << " (Match: send=" << (qpw.qp->send_cq == init_attr.send_cq ? "YES" : "NO")
+                  << ", recv=" << (qpw.qp->recv_cq == init_attr.recv_cq ? "YES" : "NO") << ")";
+      }
+    }
+    
+    CHECK(ibv_post_send(qpw.qp, wr, &bad_wr) == 0);
+
+    subflow->txtracking.track_chunk(ureq, wr_ex, now, imm_data.GetCSN(),
+                                    imm_data.GetHINT());
+
+    // Arm timer for TX (application-level reliability for UD)
+    arm_timer_for_flow(subflow);
+
+    *sent_offset += chunk_size;
+
+    static std::atomic<uint64_t> ud_tx_count{0};
+    auto count = ud_tx_count.fetch_add(1);
+    if (count % 100 == 0) {
+      LOG(INFO) << "UD TX progress: " << count << " packets sent";
+    }
+
+    UCCL_LOG_IO << "UD Tx: flow#" << flow->flowid() << ", req id#"
+                << ureq->send.rid << ", csn: " << csn.to_uint32()
+                << ", chunk size: " << chunk_size << ", QP#" << qpidx;
+
+    if (size == 0) break;
+  }
+
+  return true;
+}
+
+bool RDMAContext::ud_senderCC_tx_read(struct ucclRequest* ureq) {
+  // UD doesn't support RDMA_READ, implement using request-response pattern with
+  // SEND Use data QP for both request and response (similar to UC/RC pattern)
+  auto* flow = reinterpret_cast<UcclFlow*>(ureq->context);
+  auto* subflow = flow->sub_flows_[engine_offset_];
+
+  auto size = ureq->send.data_len;
+  auto laddr = ureq->send.laddr;
+  auto raddr = ureq->send.raddr;
+  auto lkey = ureq->send.lkey;
+  auto rid = ureq->send.rid;
+  uint32_t* sent_offset = &ureq->send.sent_offset;
+  uint32_t chunk_size;
+
+  if (size == 0) {
+    CHECK(false) << "UD READ len 0";
+    return true;
+  }
+
+  while (*sent_offset < size) {
+    chunk_size = EventOnChunkSize(subflow, size - *sent_offset);
+
+    if (chunk_size == 0 && size) return false;
+
+    auto csn = subflow->pcb.get_snd_nxt();
+    uint32_t qpidx = select_qpidx_pot(chunk_size, subflow);
+
+    // Create READ_REQUEST packet using retransmission buffer
+    auto retr_hdr = io_ctx_->pop_retr_hdr();
+    auto* read_req = reinterpret_cast<UcclReadReqHdr*>(retr_hdr);
+
+    read_req->peer_id = be16_t(remote_ctx_.remote_peer_id);
+    read_req->fid = be16_t(subflow->fid_);
+    read_req->csn = be16_t(csn.to_uint32());
+    read_req->qpidx = be16_t(qpidx);
+    read_req->rid = be32_t(rid);
+    read_req->offset = be32_t(*sent_offset);
+    read_req->len = be32_t(chunk_size);
+
+    // Send READ_REQUEST via data QP (like UC/RC uses data QP for all
+    // operations)
+    uint64_t wr_addr;
+    CHECK_EQ(wr_ex_pool_->alloc_buff(&wr_addr), 0);
+    struct wr_ex* wr_ex = reinterpret_cast<struct wr_ex*>(wr_addr);
+    auto* wr = &wr_ex->wr;
+
+    wr_ex->sge.addr = retr_hdr;
+    wr_ex->sge.length = sizeof(UcclReadReqHdr);
+    wr_ex->sge.lkey = io_ctx_->get_retr_chunk_lkey();
+    wr_ex->qpidx = qpidx;
+
+    wr->sg_list = &wr_ex->sge;
+    wr->num_sge = 1;
+    wr->opcode = IBV_WR_SEND_WITH_IMM;
+    wr->send_flags = IBV_SEND_SIGNALED;
+
+    // Set CQE descriptor
+    auto* cqe_desc = io_ctx_->pop_cqe_desc();
+    cqe_desc->data = (uint64_t)wr_ex;
+    cqe_desc->type = 0;  // Normal send
+    wr->wr_id = (uint64_t)cqe_desc;
+
+    // Set immediate data to indicate READ_REQUEST
+    IMMData imm_data;
+    imm_data.SetCSN(csn.to_uint32());
+    imm_data.SetHINT(0);  // 0 = READ_REQUEST
+    wr->imm_data = htonl(imm_data.GetImmData());
+
+    // Set UD addressing for data QP
+    wr->wr.ud.ah = remote_ctx_.dest_ah;
+    wr->wr.ud.remote_qpn = remote_ctx_.remote_qpns[qpidx];
+    wr->wr.ud.remote_qkey = QKEY;
+
+    auto& qpw = dp_qps_[qpidx];
+    struct ibv_send_wr* bad_wr;
+    int ret = ibv_post_send(qpw.qp, wr, &bad_wr);
+    if (ret) {
+      io_ctx_->push_retr_hdr(retr_hdr);
+      wr_ex_pool_->free_buff(wr_addr);
+      return false;
+    }
+
+    // Track this as pending read - response will arrive on same data QP
+    struct wr_ex* read_wr_ex = reinterpret_cast<struct wr_ex*>(wr_addr);
+    read_wr_ex->sge.addr = laddr + *sent_offset;
+    read_wr_ex->sge.lkey = lkey;
+    read_wr_ex->sge.length = chunk_size;
+    read_wr_ex->qpidx = qpidx;
+
+    // hint=1 for last READ request, hint=0 if more READ requests follow
+    int hint = (*sent_offset + chunk_size == size) ? 1 : 0;
+    subflow->txtracking.track_chunk(ureq, read_wr_ex, rdtsc(), csn.to_uint32(),
+                                    hint);
+
+    // Arm timer for response timeout
+    arm_timer_for_flow(subflow);
+
+    *sent_offset += chunk_size;
+
+    UCCL_LOG_IO << "UD READ_REQUEST sent: flow#" << flow->flowid()
+                << ", rid=" << rid << ", csn=" << csn.to_uint32()
+                << ", size=" << chunk_size;
+
+    if (size == 0) break;
+  }
+
+  return true;
+}
+
+bool RDMAContext::ud_senderCC_tx_message(struct ucclRequest* ureq) {
+  // For UD, use SEND operations for regular messages
+  return ud_senderCC_tx_write(ureq);
+}
+
 void RDMAContext::uc_post_acks() {
   int num_ack = 0;
   struct list_head *pos, *n;
@@ -2683,7 +2999,19 @@ bool RDMAContext::try_retransmit_chunk(SubUcclFlow* subflow,
 
   struct retr_chunk_hdr* hdr =
       reinterpret_cast<struct retr_chunk_hdr*>(retr_hdr);
-  hdr->remote_addr = wr_ex->wr.wr.rdma.remote_addr;
+  
+  // For UD, we need to store the destination offset (not remote_addr)
+  // For UC, remote_addr is the RDMA write target address
+  if (io_ctx_->is_ud_for_data()) {
+    // UD: Store source buffer for retransmission
+    hdr->remote_addr = wr_ex->sge.addr;
+    // Use the tracked destination offset from when chunk was originally sent
+    hdr->dest_offset = wr_ex->dest_offset;
+  } else {
+    hdr->remote_addr = wr_ex->wr.wr.rdma.remote_addr;  // UC uses RDMA address
+    hdr->dest_offset = 0;  // Not used for UC
+  }
+  
   // Network byte order.
   hdr->imm_data = wr_ex->wr.imm_data;
 
@@ -2695,6 +3023,7 @@ bool RDMAContext::try_retransmit_chunk(SubUcclFlow* subflow,
 
   auto* cqe_desc = io_ctx_->pop_cqe_desc();
   cqe_desc->data = retr_hdr;
+  cqe_desc->type = 1;  // Retransmission (not normal send)
   retr_wr.wr_id = (uint64_t)cqe_desc;
   retr_wr.sg_list = retr_sge;
   retr_wr.num_sge = 2;
@@ -2702,12 +3031,19 @@ bool RDMAContext::try_retransmit_chunk(SubUcclFlow* subflow,
   retr_wr.send_flags = IBV_SEND_SIGNALED;
   retr_wr.next = nullptr;
 
+  // UD requires explicit addressing
+  if (io_ctx_->is_ud_for_data()) {
+    retr_wr.wr.ud.ah = remote_ctx_.dest_ah;
+    retr_wr.wr.ud.remote_qpn = remote_ctx_.remote_qpns[wr_ex->qpidx];
+    retr_wr.wr.ud.remote_qkey = QKEY;
+  }
+
   int ret = ibv_post_send(lossy_qpw->qp, &retr_wr, &bad_wr);
   DCHECK(ret == 0) << ret;
 
   UCCL_LOG_IO << "successfully retransmit chunk for QP#"
               << std::distance(dp_qps_.begin(), dp_qps_.begin() + wr_ex->qpidx)
-              << ", remote_addr: " << wr_ex->wr.wr.rdma.remote_addr
+              << ", remote_addr: " << (io_ctx_->is_ud_for_data() ? wr_ex->sge.addr : wr_ex->wr.wr.rdma.remote_addr)
               << ", chunk_size: " << wr_ex->sge.length
               << ", csn: " << IMMData(ntohl(wr_ex->wr.imm_data)).GetCSN()
               << " for flow: " << subflow->fid_;
@@ -3540,6 +3876,369 @@ std::string RDMAContext::to_string() {
 
   return s;
 }
+
+// UD-specific implementations (application-level reliability)
+void RDMAContext::ud_post_acks() {
+  // Same as uc_post_acks - UD also sends ACKs via control QP
+  uc_post_acks();
+}
+
+template <typename T>
+void RDMAContext::ud_rx_chunk(T* wc_or_cq_ex) {
+  // UD receives both normal and retransmission data into GPU buffers
+  // (GPUDirect) Detection: Check IBV_WC_WITH_IMM flag
+  // - Normal: SEND_WITH_IMM → flag set → GPU-to-GPU copy
+  // - Retransmission: SEND (no IMM) → flag not set → GPU→CPU→GPU via
+  // ud_rx_rtx_chunk()
+  static constexpr bool is_wc = std::is_same_v<T, struct ibv_wc>;
+  auto now = rdtsc();
+  uint32_t byte_len, imm_value, qp_num;
+  uint64_t wr_id;
+  bool has_imm;
+
+  if constexpr (is_wc) {
+    byte_len = wc_or_cq_ex->byte_len;
+    imm_value = wc_or_cq_ex->imm_data;
+    qp_num = wc_or_cq_ex->qp_num;
+    wr_id = wc_or_cq_ex->wr_id;
+    has_imm = (wc_or_cq_ex->wc_flags & IBV_WC_WITH_IMM);
+  } else {
+    byte_len = ibv_wc_read_byte_len(wc_or_cq_ex);
+    imm_value = ibv_wc_read_imm_data(wc_or_cq_ex);
+    qp_num = ibv_wc_read_qp_num(wc_or_cq_ex);
+    wr_id = wc_or_cq_ex->wr_id;  // wr_id is a direct member, not a function
+    has_imm = (ibv_wc_read_wc_flags(wc_or_cq_ex) & IBV_WC_WITH_IMM);
+  }
+
+  // Extract GPU buffer address from CQEDesc
+  auto* cqe_desc = (CQEDesc*)wr_id;
+  uint64_t gpu_buf_addr = cqe_desc->data;
+
+  // Check if this is a retransmission
+  if (!has_imm) {
+    // No immediate data - retransmission with retr_chunk_hdr in GPU buffer
+    ud_rx_rtx_chunk(wc_or_cq_ex, gpu_buf_addr);
+    return;
+  }
+
+  // Normal data packet processing
+  // With 2-SGE approach (GRH in separate buffer), byte_len is already correct
+  // No need to subtract UD_ADDITION as GRH is in SGE[0], data in SGE[1]
+
+  auto imm_data = IMMData(ntohl(imm_value));
+  auto qpidx = qpn2idx_[qp_num];
+
+  auto last_chunk = imm_data.GetHINT();
+  auto csn = imm_data.GetCSN();
+  auto rid = imm_data.GetRID();
+  auto fid = imm_data.GetFID();
+
+  static std::atomic<uint64_t> ud_rx_count{0};
+  auto count = ud_rx_count.fetch_add(1);
+  if (count % 100 == 0) {
+    LOG(INFO) << "UD RX progress: " << count << " packets received";
+  }
+
+  DCHECK(fid < MAX_FLOW);
+  auto* flow = reinterpret_cast<UcclFlow*>(receiver_flow_tbl_[fid]);
+  DCHECK(flow) << fid << ", RDMAContext ptr: " << this;
+  auto* subflow = flow->sub_flows_[engine_offset_];
+
+  UCCL_LOG_IO << "UD Received chunk: (byte_len, csn, rid, fid): " << byte_len
+              << ", " << csn << ", " << rid << ", " << fid << " from QP#"
+              << qpidx;
+
+  // Locate request by rid
+  DCHECK(rid < kMaxReq);
+  auto req = subflow->get_recvreq_by_id(rid);
+  if (req->type != RecvRequest::RECV || req->ureq->context != flow) {
+    UCCL_LOG_IO << "Can't find corresponding request. Dropping.";
+    subflow->pcb.stats_chunk_drop++;
+    return;
+  }
+
+  // Validate receive request has valid destination buffer
+  if (req->ureq->recv.elems == nullptr || req->ureq->recv.elems[0].addr == 0) {
+    LOG(ERROR) << "UD recv request has NULL destination buffer!"
+               << " rid=" << rid << ", fid=" << fid << ", csn=" << csn
+               << ", req->type=" << req->type
+               << ", recv.elems=" << (void*)req->ureq->recv.elems
+               << ", recv.elems[0].addr=" << std::hex << (req->ureq->recv.elems ? req->ureq->recv.elems[0].addr : 0)
+               << std::dec
+               << ", received_bytes[0]=" << req->received_bytes[0];
+    subflow->pcb.stats_chunk_drop++;
+    return;
+  }
+
+  // Compare CSN with the expected CSN (application-level sequencing for UD)
+  auto ecsn = subflow->pcb.rcv_nxt;
+  auto distance = UINT_CSN(csn) - ecsn;
+
+  if (UINT_CSN::uintcsn_seqno_lt(UINT_CSN(csn), ecsn)) {
+    UCCL_LOG_IO << "UD Chunk lag behind. csn: " << csn
+                << ", ecsn: " << ecsn.to_uint32();
+    subflow->pcb.stats_chunk_drop++;
+    return;
+  }
+
+  if (distance.to_uint32() > kReassemblyMaxSeqnoDistance) {
+    UCCL_LOG_IO << "UD Chunk too far ahead. csn: " << csn
+                << ", ecsn: " << ecsn.to_uint32();
+    subflow->pcb.stats_chunk_drop++;
+    return;
+  }
+
+  CHECK(!subflow->pcb.sack_bitmap_bit_is_set(distance.to_uint32()));
+
+  // Perform GPU-to-GPU copy (zero-copy via GPUDirect RDMA)
+  // For UD mode, get destination address from FifoItem, not from ureq->recv.data
+  uint32_t dest_offset = req->received_bytes[0];
+  uint64_t dest_addr = req->ureq->recv.elems[0].addr + dest_offset;
+
+  UCCL_LOG_IO << "UD GPU-to-GPU copy: " << byte_len << " bytes from GPU "
+              << std::hex << gpu_buf_addr << " to GPU dest " << dest_addr
+              << std::dec << " (offset: " << dest_offset << ")";
+
+  // GPU-to-GPU async copy
+  // With 2-SGE approach: GRH is in separate buffer, gpu_buf_addr points directly to data
+  void* gpu_data_ptr = reinterpret_cast<void*>(gpu_buf_addr);
+
+#ifndef __HIP_PLATFORM_AMD__
+  cudaError_t err = cudaMemcpyAsync((void*)dest_addr, gpu_data_ptr, byte_len,
+                                    cudaMemcpyDeviceToDevice, 0);
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "UD GPU-to-GPU copy failed: " << cudaGetErrorString(err)
+               << " (src=0x" << std::hex << gpu_buf_addr 
+               << ", dst=0x" << dest_addr << std::dec
+               << ", len=" << byte_len << ")";
+    subflow->pcb.stats_chunk_drop++;
+    return;
+  }
+#else
+  hipError_t err = hipMemcpyAsync((void*)dest_addr, gpu_data_ptr, byte_len,
+                                  hipMemcpyDeviceToDevice, 0);
+  if (err != hipSuccess) {
+    LOG(ERROR) << "UD GPU-to-GPU copy failed: " << hipGetErrorString(err)
+               << " (src=0x" << std::hex << gpu_buf_addr 
+               << ", dst=0x" << dest_addr << std::dec
+               << ", len=" << byte_len << ")";
+    subflow->pcb.stats_chunk_drop++;
+    return;
+  }
+#endif
+
+  // Update timestamp for ACK turnaround calculation
+  if constexpr (kTestNoHWTimestamp || is_wc)
+    subflow->pcb.t_remote_nic_rx = now;
+  else
+    subflow->pcb.t_remote_nic_rx = ibv_wc_read_completion_ts(wc_or_cq_ex);
+
+  subflow->pcb.sack_bitmap_bit_set(distance.to_uint32());
+
+  auto* msg_size = &req->ureq->recv.elems[0].size;
+  uint32_t* received_bytes = req->received_bytes;
+  received_bytes[0] += byte_len;
+
+  if (!last_chunk) {
+    req = nullptr;
+  }
+
+  subflow->rxtracking.ready_csn_.insert({csn, req});
+
+  try_update_csn(subflow);
+
+  if (distance.to_uint32()) {
+    subflow->rxtracking.encounter_ooo();
+#ifdef STATS
+    subflow->pcb.stats_ooo++;
+    subflow->pcb.stats_maxooo =
+        std::max(subflow->pcb.stats_maxooo, distance.to_uint32());
+    if (subflow->rxtracking.real_ooo()) subflow->pcb.stats_real_ooo++;
+#endif
+  }
+
+  subflow->rxtracking.cumulate_wqe();
+  subflow->rxtracking.cumulate_bytes(byte_len);
+
+  if (list_empty(&subflow->ack.ack_link))
+    list_add_tail(&subflow->ack.ack_link, &ack_list_);
+  subflow->next_ack_path_ = qpidx;
+
+  // Send ACK if needed
+  if (subflow->rxtracking.need_imm_ack()) {
+    auto chunk_addr = io_ctx_->pop_ctrl_chunk();
+    craft_ack(subflow, chunk_addr, 0);
+    try_post_acks(1, chunk_addr, true);
+  }
+}
+
+template <typename T>
+void RDMAContext::ud_rx_ack(T* wc_or_cq_ex, UcclSackHdr* ucclsackh) {
+  // UD uses same ACK processing as UC (application-level reliability)
+  uc_rx_ack(wc_or_cq_ex, ucclsackh);
+}
+
+template <typename T>
+void RDMAContext::ud_rx_rtx_chunk(T* wc_or_cq_ex, uint64_t gpu_buf_addr) {
+  // UD retransmission handling with GPU buffers (2-SGE mode)
+  // SGE[0]: GRH (40B, CPU buffer) - handled by driver
+  // SGE[1]: retr_chunk_hdr (12B) + payload (GPU buffer)
+  // gpu_buf_addr points to SGE[1] (data buffer), not GRH
+  static constexpr bool is_wc = std::is_same_v<T, struct ibv_wc>;
+  UCCL_LOG_IO << "ud_rx_rtx_chunk (GPU buffer)";
+  auto now = rdtsc();
+
+  uint32_t byte_len;
+  if constexpr (is_wc) {
+    byte_len = wc_or_cq_ex->byte_len;
+  } else {
+    byte_len = ibv_wc_read_byte_len(wc_or_cq_ex);
+  }
+
+  // With 2-SGE: GRH in SGE[0] (separate), data in SGE[1]
+  // byte_len is already correct (only data, no GRH)
+  // gpu_buf_addr points to start of data (no GRH prefix)
+  auto chunk_len = byte_len - sizeof(struct retr_chunk_hdr);
+
+  // Header is at start of GPU data buffer (no GRH offset needed with 2-SGE)
+  struct retr_chunk_hdr hdr_cpu;
+  uint64_t gpu_hdr_addr = gpu_buf_addr;
+
+#ifndef __HIP_PLATFORM_AMD__
+  cudaMemcpy(&hdr_cpu, reinterpret_cast<void*>(gpu_hdr_addr),
+             sizeof(struct retr_chunk_hdr), cudaMemcpyDeviceToHost);
+#else
+  CHECK(hipMemcpy(&hdr_cpu, reinterpret_cast<void*>(gpu_hdr_addr),
+                  sizeof(struct retr_chunk_hdr),
+                  hipMemcpyDeviceToHost) == hipSuccess);
+#endif
+
+  auto imm_data = IMMData(ntohl(hdr_cpu.imm_data));
+
+  auto last_chunk = imm_data.GetHINT();
+  auto csn = imm_data.GetCSN();
+  auto rid = imm_data.GetRID();
+  auto fid = imm_data.GetFID();
+
+  DCHECK(fid < MAX_FLOW);
+  auto* flow = reinterpret_cast<UcclFlow*>(receiver_flow_tbl_[fid]);
+  auto* subflow = flow->sub_flows_[engine_offset_];
+
+  UCCL_LOG_IO << "UD received retransmission chunk: (csn, rid, fid): " << csn
+              << ", " << rid << ", " << fid;
+
+  // Locate request by rid
+  DCHECK(rid < kMaxReq);
+  auto req = subflow->get_recvreq_by_id(rid);
+  if (req->type != RecvRequest::RECV || req->ureq->context != flow) {
+    UCCL_LOG_IO << "Can't find corresponding request or this request is "
+                   "invalid for this retransmission chunk. Dropping. "
+                << req->type;
+    subflow->pcb.stats_retr_chunk_drop++;
+    return;
+  }
+
+  // Compare CSN with the expected CSN.
+  auto ecsn = subflow->pcb.rcv_nxt;
+  auto distance = UINT_CSN(csn) - ecsn;
+
+  if (UINT_CSN::uintcsn_seqno_lt(UINT_CSN(csn), ecsn)) {
+    // Original chunk is already received.
+    UCCL_LOG_IO << "Original chunk is already received. Dropping "
+                   "retransmission chunk for flow"
+                << fid;
+    subflow->pcb.stats_retr_chunk_drop++;
+    return;
+  }
+
+  if (distance.to_uint32() > kReassemblyMaxSeqnoDistance) {
+    UCCL_LOG_IO << "Chunk too far ahead. Dropping as we can't handle SACK. "
+                << "csn: " << csn << ", ecsn: " << ecsn.to_uint32();
+    subflow->pcb.stats_retr_chunk_drop++;
+    return;
+  }
+
+  if (subflow->pcb.sack_bitmap_bit_is_set(distance.to_uint32())) {
+    UCCL_LOG_IO << "Original chunk is already received. Dropping "
+                   "retransmission chunk for flow"
+                << fid;
+    subflow->pcb.stats_retr_chunk_drop++;
+    return;
+  }
+
+  UCCL_LOG_IO << "This UD retransmission chunk is accepted!!!";
+
+  // Accept this retransmission chunk
+  // Use destination offset from retransmission header for proper placement
+  // Get base address from FifoItem (same as normal UD receive)
+  uint64_t dest_addr = req->ureq->recv.elems[0].addr + hdr_cpu.dest_offset;
+  
+  // Payload is in GPU buffer after header (no GRH offset - it's in SGE[0])
+  uint64_t gpu_payload_addr = gpu_hdr_addr + sizeof(struct retr_chunk_hdr);
+
+  UCCL_LOG_IO << "UD retransmission GPU copy: " << chunk_len << " bytes to offset "
+              << hdr_cpu.dest_offset << " (dest_addr=" << std::hex << dest_addr << std::dec << ")";
+
+#ifdef CPU_MEMORY
+  // For CPU memory mode, copy GPU → CPU
+  void* temp_cpu_buf = malloc(chunk_len);
+  cudaMemcpy(temp_cpu_buf, reinterpret_cast<void*>(gpu_payload_addr), chunk_len,
+             cudaMemcpyDeviceToHost);
+  memcpy(reinterpret_cast<void*>(dest_addr), temp_cpu_buf, chunk_len);
+  free(temp_cpu_buf);
+#else
+  // GPU-to-GPU copy for retransmission payload using proper destination address
+#ifndef __HIP_PLATFORM_AMD__
+  cudaError_t err =
+      cudaMemcpyAsync(reinterpret_cast<void*>(dest_addr),
+                      reinterpret_cast<void*>(gpu_payload_addr), chunk_len,
+                      cudaMemcpyDeviceToDevice, 0);
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "UD retransmission GPU-to-GPU copy failed: "
+               << cudaGetErrorString(err);
+    subflow->pcb.stats_retr_chunk_drop++;
+    return;
+  }
+#else
+  hipError_t err = hipMemcpyAsync(reinterpret_cast<void*>(dest_addr),
+                                  reinterpret_cast<void*>(gpu_payload_addr),
+                                  chunk_len, hipMemcpyDeviceToDevice, 0);
+  if (err != hipSuccess) {
+    LOG(ERROR) << "UD retransmission GPU-to-GPU copy failed: "
+               << hipGetErrorString(err);
+    subflow->pcb.stats_retr_chunk_drop++;
+    return;
+  }
+#endif
+#endif
+
+  subflow->pcb.stats_accept_retr++;
+
+  subflow->pcb.sack_bitmap_bit_set(distance.to_uint32());
+
+  auto* msg_size = &req->ureq->recv.elems[0].size;
+  uint32_t* received_bytes = req->received_bytes;
+  received_bytes[0] += chunk_len;
+
+  if (!last_chunk) {
+    req = nullptr;
+  }
+
+  subflow->rxtracking.ready_csn_.insert({csn, req});
+
+  try_update_csn(subflow);
+
+  /// FIXME: Should we send ACK immediately here?
+  if (list_empty(&subflow->ack.ack_link))
+    list_add_tail(&subflow->ack.ack_link, &ack_list_);
+  // Don't let sender update the path's rtt.
+  subflow->next_ack_path_ = std::numeric_limits<uint16_t>::max();
+
+  EventOnRxRTXData(subflow, &imm_data);
+
+  return;
+}
+
 // Initialize the templates to avoid the linker error.
 template void RDMAContext::uc_rx_chunk<struct ibv_wc>(struct ibv_wc* wc);
 template void RDMAContext::uc_rx_chunk<struct ibv_cq_ex>(struct ibv_cq_ex* wc);
@@ -3555,5 +4254,17 @@ template void RDMAContext::rc_rx_ack<struct ibv_wc>(struct ibv_wc* wc);
 template void RDMAContext::rc_rx_ack<struct ibv_cq_ex>(struct ibv_cq_ex* wc);
 template void RDMAContext::rc_rx_chunk<struct ibv_wc>(struct ibv_wc* wc);
 template void RDMAContext::rc_rx_chunk<struct ibv_cq_ex>(struct ibv_cq_ex* wc);
+
+// UD template instantiations
+template void RDMAContext::ud_rx_chunk<struct ibv_wc>(struct ibv_wc* wc);
+template void RDMAContext::ud_rx_chunk<struct ibv_cq_ex>(struct ibv_cq_ex* wc);
+template void RDMAContext::ud_rx_ack<struct ibv_wc>(struct ibv_wc* wc,
+                                                    UcclSackHdr* ucclsackh);
+template void RDMAContext::ud_rx_ack<struct ibv_cq_ex>(struct ibv_cq_ex* wc,
+                                                       UcclSackHdr* ucclsackh);
+template void RDMAContext::ud_rx_rtx_chunk<struct ibv_wc>(struct ibv_wc* wc,
+                                                          uint64_t chunk_addr);
+template void RDMAContext::ud_rx_rtx_chunk<struct ibv_cq_ex>(
+    struct ibv_cq_ex* wc, uint64_t chunk_addr);
 
 }  // namespace uccl

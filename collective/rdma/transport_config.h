@@ -8,6 +8,9 @@
 
 // #define STATS
 
+// UD Q_KEY constant
+static uint32_t const QKEY = 0x11111111;
+
 // Whether to pin the thread to the NUMA node.
 UCCL_PARAM(PIN_TO_NUMA, "PIN_TO_NUMA", 1);
 // Traffic class for RoCE.
@@ -19,6 +22,9 @@ UCCL_PARAM(IB_SERVICE_LEVEL, "IB_SERVICE_LEVEL", 0);
 
 // Use RC for data transfer.
 UCCL_PARAM(RCMode, "RCMODE", false);
+
+// Use UD for data transfer (overrides RC/UC if set).
+UCCL_PARAM(UDForData, "UD_FOR_DATA", false);
 
 // Bypass the pacing stage.
 UCCL_PARAM(BypassPacing, "BYPASS_PACING", true);
@@ -167,7 +173,11 @@ static constexpr uint32_t kMaxReq =
     16;  // This should be aligned with RID in IMMData
 static constexpr uint32_t kMaxSendRecvWR = kMaxRecv * kMaxReq * 4;
 // Maximum number of WQEs in SRQ (Shared Receive Queue).
-static constexpr uint32_t kMaxSRQ = 16 * kMaxReq;
+// Increased from 256 to 2048 to better utilize Intel irdma capabilities
+// (max_srq_wr: 32767) while leaving buffer pool headroom. GPU buffer pool
+// has 4096 buffers, so 2048 SRQ + headroom avoids exhaustion during posting.
+// This reduces buffer wraparound frequency and may avoid driver issues.
+static constexpr uint32_t kMaxSRQ = 2048;
 // Maximum number of chunks can be transmitted from timing wheel in one loop.
 static constexpr uint32_t kMaxBurstTW = 8;
 // Posting recv WQEs every kPostRQThreshold.

@@ -11,6 +11,7 @@
 #include "util_rdma.h"
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <set>
@@ -35,6 +36,8 @@ extern std::shared_ptr<RDMAFactory> rdma_ctl;
 struct CQEDesc {
   uint64_t data;
   uint64_t ts;
+  uint8_t type;  // 0=normal send/recv, 1=retransmission, 2=control
+  uint8_t reserved[7];  // Padding for alignment
 };
 
 class CQEDescPool : public BuffPool {
@@ -49,12 +52,13 @@ class CQEDescPool : public BuffPool {
 };
 
 struct __attribute__((packed)) retr_chunk_hdr {
-  // Target address for the lost chunk.
+  // Target address for the lost chunk (UC mode uses this for RDMA addr).
   uint64_t remote_addr;
   uint32_t imm_data;
+  uint32_t dest_offset;  // For UD: byte offset in receiver's buffer
 };
-static_assert(sizeof(struct retr_chunk_hdr) == 12,
-              "retr_chunk_hdr size is not 12 bytes");
+static_assert(sizeof(struct retr_chunk_hdr) == 16,
+              "retr_chunk_hdr size is not 16 bytes");
 
 /**
  * @brief Buffer pool for retransmission chunks (original chunk + retransmission
@@ -82,6 +86,7 @@ class RetrHdrBuffPool : public BuffPool {
   static constexpr size_t kHdrSize = sizeof(struct retr_chunk_hdr);
   static constexpr uint32_t kNumHdr = 4096;
   static_assert((kNumHdr & (kNumHdr - 1)) == 0, "kNumHdr must be power of 2");
+  static_assert(kHdrSize == 16, "retr_chunk_hdr must be 16 bytes");
 
   RetrHdrBuffPool(struct ibv_mr* mr) : BuffPool(kNumHdr, kHdrSize, mr) {}
 
@@ -102,6 +107,23 @@ class CtrlChunkBuffPool : public BuffPool {
   CtrlChunkBuffPool(struct ibv_mr* mr) : BuffPool(kNumChunk, kChunkSize, mr) {}
 
   ~CtrlChunkBuffPool() = default;
+};
+
+/**
+ * @brief Buffer pool for GPU receive buffers (UD mode).
+ * Receives normal data directly from network via GPUDirect RDMA.
+ * Retransmissions also arrive here but are handled with GPU→CPU→GPU copy.
+ */
+class GPURecvBuffPool : public BuffPool {
+ public:
+  static constexpr uint32_t kNumChunk = 4096;
+  static_assert((kNumChunk & (kNumChunk - 1)) == 0,
+                "kNumChunk must be power of 2");
+
+  GPURecvBuffPool(struct ibv_mr* mr, size_t chunk_size)
+      : BuffPool(kNumChunk, chunk_size, mr) {}
+
+  ~GPURecvBuffPool() = default;
 };
 
 /**
@@ -159,6 +181,7 @@ struct RemoteRDMAContext {
   uint32_t remote_ctrl_qpn;
   uint32_t remote_peer_id;
   struct ibv_ah* dest_ah;
+  std::vector<uint32_t> remote_qpns;  // For UD data QPs
 };
 
 enum ReqType { ReqTx, ReqRx, ReqFlush, ReqTxRC, ReqRxRC, ReqRead, ReqWrite };
@@ -496,12 +519,26 @@ static_assert(kUcclSackHdrLen == 36, "UcclSackHdr size mismatch");
 static_assert(CtrlChunkBuffPool::kPktSize >= kUcclSackHdrLen,
               "CtrlChunkBuffPool::PktSize must be larger than UcclSackHdr");
 
+// UD READ request header
+struct __attribute__((packed)) UcclReadReqHdr {
+  be16_t peer_id;
+  be16_t fid;
+  be16_t csn;
+  be16_t qpidx;
+  be32_t rid;
+  be32_t offset;
+  be32_t len;
+};
+static_assert(sizeof(UcclReadReqHdr) == 20, "UcclReadReqHdr size mismatch");
+
 class UcclEngine;
 
 struct RecvWRs {
   struct ibv_recv_wr recv_wrs[kPostRQThreshold];
   struct ibv_sge recv_sges[kPostRQThreshold];
-  uint32_t post_rq_cnt = 0;
+  struct ibv_sge recv_grh_sges[kPostRQThreshold];  // For UD: GRH buffer (40 bytes)
+  struct ibv_sge ud_sge_arrays[kPostRQThreshold][2];  // For UD: [GRH, Data] per WR
+  std::atomic<uint32_t> post_rq_cnt{0};  // Atomic to prevent race between multiple polling threads
 };
 
 class SharedIOContext;
@@ -625,13 +662,20 @@ static inline int modify_qp_rtr(struct ibv_qp* qp, int dev,
                                 struct RemoteRDMAContext* remote_ctx,
                                 uint32_t remote_qpn) {
   struct ibv_qp_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_RTR;
+
+  // For UD QPs, only need to set state. Address vector is per-WR.
+  if (qp->qp_type == IBV_QPT_UD) {
+    return ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+  }
+
+  // For RC/UC QPs, need to set MTU, AV, dest QPN, PSN, etc.
   int attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_AV | IBV_QP_DEST_QPN |
                   IBV_QP_RQ_PSN;
 
   auto factory_dev = RDMAFactory::get_factory_dev(dev);
 
-  memset(&attr, 0, sizeof(attr));
-  attr.qp_state = IBV_QPS_RTR;
   attr.path_mtu = factory_dev->port_attr.active_mtu;
   attr.ah_attr.port_num = factory_dev->ib_port_num;
   if (RDMAFactory::is_roce(dev)) {
@@ -712,11 +756,22 @@ struct pair_hash {
 // Shared IO context for each UCCL engine.
 class SharedIOContext {
  public:
-  SharedIOContext(int dev) {
+  SharedIOContext(int dev)
+      : gpu_recv_mr_(nullptr), gpu_recv_buf_(nullptr), gpu_recv_chunk_size_(0),
+        ud_grh_mr_(nullptr), ud_grh_buf_base_(0), ud_grh_lkey_(0) {
     support_cq_ex_ = RDMAFactory::get_factory_dev(dev)->support_cq_ex;
     rc_mode_ = ucclParamRCMode();
+    ud_for_data_ = ucclParamUDForData();
     auto support_uc = RDMAFactory::get_factory_dev(dev)->support_uc;
     auto ib_name = RDMAFactory::get_factory_dev(dev)->ib_name;
+
+    if (ud_for_data_) {
+      printf("Using UD for data transfer on dev %s\n", ib_name);
+      rc_mode_ = false;  // UD mode overrides RC mode
+      // WORKAROUND: irdma driver bug with UD+SRQ+CQ_EX - force regular CQ for UD
+      support_cq_ex_ = false;
+    }
+
     if (rc_mode_) {
       if (support_uc) {
         printf(
@@ -724,24 +779,40 @@ class SharedIOContext {
             "using RC may give less optimized/scalable performance.\n",
             ib_name);
       }
-    } else {
+    } else if (!ud_for_data_) {
       rc_mode_ = !support_uc;
     }
     bypass_pacing_ = ucclParamBypassPacing();
     auto context = RDMAFactory::get_factory_dev(dev)->context;
     auto pd = RDMAFactory::get_factory_dev(dev)->pd;
     auto port = RDMAFactory::get_factory_dev(dev)->ib_port_num;
-    if (support_cq_ex_) {
+    
+    // WORKAROUND: irdma driver bug with UD+SRQ+CQ_EX - use regular CQ for UD mode
+    bool use_cq_ex = support_cq_ex_ && !ud_for_data_;
+    
+    if (use_cq_ex) {
       send_cq_ex_ = util_rdma_create_cq_ex(context, kCQSize);
       recv_cq_ex_ = util_rdma_create_cq_ex(context, kCQSize);
+      LOG(INFO) << "Using CQ_EX for data path (mode: " 
+                << (ud_for_data_ ? "UD" : (rc_mode_ ? "RC" : "UC")) << ")";
     } else {
       send_cq_ex_ = (struct ibv_cq_ex*)util_rdma_create_cq(context, kCQSize);
       recv_cq_ex_ = (struct ibv_cq_ex*)util_rdma_create_cq(context, kCQSize);
+      if (ud_for_data_) {
+        LOG(INFO) << "Using regular CQ for UD mode (irdma driver bug workaround)";
+      } else {
+        LOG(INFO) << "Using regular CQ (CQ_EX not supported)";
+      }
     }
-    UCCL_INIT_CHECK(send_cq_ex_ != nullptr, "util_rdma_create_cq_ex failed");
-    UCCL_INIT_CHECK(recv_cq_ex_ != nullptr, "util_rdma_create_cq_ex failed");
+    UCCL_INIT_CHECK(send_cq_ex_ != nullptr, "CQ creation failed");
+    UCCL_INIT_CHECK(recv_cq_ex_ != nullptr, "CQ creation failed");
+    UCCL_INIT_CHECK(send_cq_ex_ != recv_cq_ex_, 
+                    "CRITICAL: send_cq and recv_cq are the SAME! This will cause opcode confusion.");
+    LOG(INFO) << "CQ creation: send_cq=" << (void*)send_cq_ex_ 
+              << ", recv_cq=" << (void*)recv_cq_ex_ << " (different: " 
+              << (send_cq_ex_ != recv_cq_ex_ ? "YES" : "NO") << ")";
 
-    if (support_cq_ex_) {
+    if (use_cq_ex) {
       int ret =
           util_rdma_modify_cq_attr(send_cq_ex_, kCQMODCount, kCQMODPeriod);
       UCCL_INIT_CHECK(ret == 0, "util_rdma_modify_cq_attr failed");
@@ -749,8 +820,12 @@ class SharedIOContext {
       UCCL_INIT_CHECK(ret == 0, "util_rdma_modify_cq_attr failed");
     }
 
-    srq_ = util_rdma_create_srq(pd, kMaxSRQ, 1, 0);
+    // UD mode requires 2 SGEs (GRH + data), UC/RC only need 1
+    uint32_t srq_max_sge = ud_for_data_ ? 2 : 1;
+    srq_ = util_rdma_create_srq(pd, kMaxSRQ, srq_max_sge, 0);
     UCCL_INIT_CHECK(srq_ != nullptr, "util_rdma_create_srq failed");
+    LOG(INFO) << "SRQ created with max_sge=" << srq_max_sge 
+              << " (UD mode: " << (ud_for_data_ ? "YES" : "NO") << ")";
 
     retr_mr_ = util_rdma_create_host_memory_mr(
         pd, kRetrChunkSize * RetrChunkBuffPool::kNumChunk);
@@ -760,15 +835,79 @@ class SharedIOContext {
     // Initialize retransmission chunk and header buffer pool.
     retr_chunk_pool_.emplace(retr_mr_);
     retr_hdr_pool_.emplace(retr_hdr_mr_);
+    
+    // For UD: Allocate CPU buffer pool for GRH headers (40 bytes each)
+    // irdma driver requires GRH in separate SGE for proper handling
+    // CRITICAL: Must allocate same number as GPU buffers for 1-to-1 pairing
+    if (ud_for_data_) {
+      ud_grh_mr_ = util_rdma_create_host_memory_mr(pd, 40 * GPURecvBuffPool::kNumChunk);
+      ud_grh_buf_base_ = (uint64_t)ud_grh_mr_->addr;
+      ud_grh_lkey_ = ud_grh_mr_->lkey;
+      LOG(INFO) << "UD GRH buffer pool allocated: " << GPURecvBuffPool::kNumChunk 
+                << " buffers, 40 bytes each (" << (40 * GPURecvBuffPool::kNumChunk / 1024) << " KB)";
+    }
 
     cq_desc_mr_ = util_rdma_create_host_memory_mr(
         pd, CQEDescPool::kNumDesc * CQEDescPool::kDescSize);
     cq_desc_pool_.emplace(cq_desc_mr_);
 
+    // Initialize GPU receive buffer pool for UD mode (Managed Memory for Intel irdma compatibility)
+    if (ud_for_data_) {
+      // For UD, cap chunk size to MTU - UD_ADDITION (GRH overhead)
+      auto factory_dev = RDMAFactory::get_factory_dev(dev);
+      uint32_t mtu_bytes = util_rdma_get_mtu_from_ibv_mtu(factory_dev->port_attr.active_mtu);
+      uint32_t ud_max_size = mtu_bytes - UD_ADDITION;
+      
+      gpu_recv_chunk_size_ = std::min((uint32_t)kRetrChunkSize, ud_max_size);
+      
+      if (kRetrChunkSize > ud_max_size) {
+        LOG(WARNING) << "UD mode: GPU recv buffer chunk size reduced from " 
+                     << kRetrChunkSize << " to " << gpu_recv_chunk_size_ 
+                     << " bytes (MTU=" << mtu_bytes << ", GRH=" << UD_ADDITION << ")";
+      }
+      
+      size_t total_gpu_size = gpu_recv_chunk_size_ * GPURecvBuffPool::kNumChunk;
+
+#ifndef __HIP_PLATFORM_AMD__
+      cudaError_t cuda_err = cudaMallocManaged(&gpu_recv_buf_, total_gpu_size,
+                                                cudaMemAttachGlobal);
+      UCCL_INIT_CHECK(cuda_err == cudaSuccess,
+                      "cudaMallocManaged failed for GPU receive buffers: " +
+                          std::string(cudaGetErrorString(cuda_err)));
+#else
+      hipError_t hip_err = hipMallocManaged(&gpu_recv_buf_, total_gpu_size);
+      UCCL_INIT_CHECK(hip_err == hipSuccess,
+                      "hipMallocManaged failed for GPU receive buffers: " +
+                          std::string(hipGetErrorString(hip_err)));
+#endif
+
+      gpu_recv_mr_ =
+          ibv_reg_mr(pd, gpu_recv_buf_, total_gpu_size,
+                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                         IBV_ACCESS_REMOTE_READ);
+      UCCL_INIT_CHECK(gpu_recv_mr_ != nullptr,
+                      "ibv_reg_mr failed for GPU receive buffers");
+
+      gpu_recv_pool_.emplace(gpu_recv_mr_, gpu_recv_chunk_size_);
+
+      LOG(INFO) << "Allocated " << total_gpu_size / (1024 * 1024)
+                << " MB GPU receive buffer pool for UD (Managed Memory)";
+    }
+
     // Populate recv work requests to SRQ for consuming immediate data.
     inc_post_srq(kMaxSRQ);
     while (get_post_srq_cnt() > 0) {
       check_srq(true);
+    }
+    
+    // CRITICAL for UD: Ensure driver processes all SRQ buffers before QPs become active
+    // Without this, early sends may encounter RNR due to driver-level race condition
+    if (ud_for_data_) {
+      // Poll the SRQ's CQ to ensure all buffers are processed by the driver
+      // This acts as a synchronization barrier
+      usleep(1000);  // 1ms delay to let driver process SRQ posting
+      LOG(INFO) << "UD SRQ: Initialization complete, posted " << kMaxSRQ 
+                << " buffers (" << gpu_recv_chunk_size_ << " bytes each)";
     }
 
     if (!rc_mode_) {
@@ -825,9 +964,25 @@ class SharedIOContext {
     ibv_destroy_srq(srq_);
     ibv_dereg_mr(retr_mr_);
     ibv_dereg_mr(retr_hdr_mr_);
+
+    if (gpu_recv_mr_) {
+      ibv_dereg_mr(gpu_recv_mr_);
+    }
+    if (gpu_recv_buf_) {
+#ifndef __HIP_PLATFORM_AMD__
+      cudaFree(gpu_recv_buf_);
+#else
+      hipFree(gpu_recv_buf_);
+#endif
+    }
+    if (ud_grh_mr_) {
+      ibv_dereg_mr(ud_grh_mr_);
+    }
   }
 
   inline bool is_rc_mode() { return rc_mode_; }
+
+  inline bool is_ud_for_data() { return ud_for_data_; }
 
   inline bool bypass_pacing() { return bypass_pacing_; }
 
@@ -849,6 +1004,12 @@ class SharedIOContext {
   int rc_poll_recv_cq(void) {
     return support_cq_ex_ ? _rc_poll_recv_cq_ex() : _rc_poll_recv_cq_normal();
   }
+  int ud_poll_send_cq(void) {
+    return support_cq_ex_ ? _ud_poll_send_cq_ex() : _ud_poll_send_cq_normal();
+  }
+  int ud_poll_recv_cq(void) {
+    return support_cq_ex_ ? _ud_poll_recv_cq_ex() : _ud_poll_recv_cq_normal();
+  }
 
   int _poll_ctrl_cq_normal(void);
   int _poll_ctrl_cq_ex(void);
@@ -864,6 +1025,12 @@ class SharedIOContext {
 
   int _rc_poll_recv_cq_normal(void);
   int _rc_poll_recv_cq_ex(void);
+
+  int _ud_poll_send_cq_normal(void);
+  int _ud_poll_send_cq_ex(void);
+
+  int _ud_poll_recv_cq_normal(void);
+  int _ud_poll_recv_cq_ex(void);
 
   void check_srq(bool force);
 
@@ -891,7 +1058,9 @@ class SharedIOContext {
     return reinterpret_cast<CQEDesc*>(addr);
   }
 
-  inline void push_retr_hdr(uint64_t addr) { retr_hdr_pool_->free_buff(addr); }
+  inline void push_retr_hdr(uint64_t addr) {
+    retr_hdr_pool_->free_buff(addr);
+  }
   inline uint64_t pop_retr_hdr() {
     uint64_t addr;
     CHECK(retr_hdr_pool_->alloc_buff(&addr) == 0)
@@ -916,6 +1085,36 @@ class SharedIOContext {
     CHECK(ctrl_chunk_pool_->alloc_buff(&addr) == 0)
         << "Failed to allocate buffer for control chunk";
     return addr;
+  }
+
+  inline uint32_t get_gpu_recv_chunk_lkey(void) {
+    CHECK(gpu_recv_pool_.has_value()) << "GPU receive pool not initialized!";
+    return gpu_recv_pool_->get_lkey();
+  }
+  inline void push_gpu_recv_chunk(uint64_t addr) {
+    CHECK(gpu_recv_pool_.has_value()) << "GPU receive pool not initialized!";
+    gpu_recv_pool_->free_buff(addr);
+  }
+  inline uint64_t pop_gpu_recv_chunk() {
+    CHECK(gpu_recv_pool_.has_value()) << "GPU receive pool not initialized!";
+    CHECK(gpu_recv_mr_ != nullptr) << "GPU receive MR not initialized!";
+    uint64_t addr;
+    int ret = gpu_recv_pool_->alloc_buff(&addr);
+    CHECK(ret == 0) << "Failed to allocate buffer for GPU receive chunk, ret=" << ret
+                    << ", available buffers=" << gpu_recv_pool_->size()
+                    << ", chunk_size=" << gpu_recv_chunk_size_;
+    return addr;
+  }
+
+  inline uint64_t get_grh_buf_for_gpu_buf(uint64_t gpu_buf_addr) {
+    // Each GPU buffer has a corresponding GRH buffer at the same index
+    // Calculate index from GPU buffer base address
+    uint64_t gpu_base = (uint64_t)gpu_recv_mr_->addr;
+    uint64_t offset = gpu_buf_addr - gpu_base;
+    uint32_t buf_index = offset / gpu_recv_chunk_size_;
+    CHECK(buf_index < GPURecvBuffPool::kNumChunk) 
+        << "Invalid GPU buffer index: " << buf_index;
+    return ud_grh_buf_base_ + (buf_index * 40);
   }
 
   inline RDMAContext* qpn_to_rdma_ctx(int qp_num) {
@@ -958,6 +1157,8 @@ class SharedIOContext {
 
   bool rc_mode_;
 
+  bool ud_for_data_;
+
   bool bypass_pacing_;
 
   struct ibv_qp* ctrl_qp_;
@@ -979,6 +1180,8 @@ class SharedIOContext {
   std::optional<CQEDescPool> cq_desc_pool_;
   // Buffer pool for control chunks.
   std::optional<CtrlChunkBuffPool> ctrl_chunk_pool_;
+  // Buffer pool for GPU receive buffers (UD mode only).
+  std::optional<GPURecvBuffPool> gpu_recv_pool_;
 
   // Pre-allocated WQEs for consuming immediate data.
   struct RecvWRs dp_recv_wrs_;
@@ -996,6 +1199,14 @@ class SharedIOContext {
   struct ibv_mr* retr_mr_;
   struct ibv_mr* retr_hdr_mr_;
   struct ibv_mr* cq_desc_mr_;
+  // Memory region for GPU receive buffers (UD mode).
+  struct ibv_mr* gpu_recv_mr_;
+  void* gpu_recv_buf_;
+  size_t gpu_recv_chunk_size_;
+  // Memory region for UD GRH headers (40 bytes each)
+  struct ibv_mr* ud_grh_mr_;
+  uint64_t ud_grh_buf_base_;
+  uint32_t ud_grh_lkey_;
 
   std::unordered_map<int, RDMAContext*> qpn_to_rdma_ctx_map_;
 

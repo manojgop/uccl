@@ -9,6 +9,7 @@
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -505,12 +506,86 @@ void SharedIOContext::check_srq(bool force) {
 
   for (int i = 0; i < post_batch; i++) {
     if (!is_rc_mode()) {
-      auto chunk_addr = pop_retr_chunk();
-      dp_recv_wrs_.recv_sges[i].addr = chunk_addr;
-      dp_recv_wrs_.recv_sges[i].length = kRetrChunkSize;
-      dp_recv_wrs_.recv_sges[i].lkey = get_retr_chunk_lkey();
-      dp_recv_wrs_.recv_wrs[i].num_sge = 1;
-      dp_recv_wrs_.recv_wrs[i].sg_list = &dp_recv_wrs_.recv_sges[i];
+      // UD/UC mode: Post buffers to SRQ
+      uint64_t chunk_addr;
+      uint32_t chunk_len;
+      uint32_t lkey;
+
+      if (is_ud_for_data()) {
+        // UD uses GPU buffers for GPUDirect with MTU-limited size
+        chunk_addr = pop_gpu_recv_chunk();
+        chunk_len = gpu_recv_chunk_size_;  // Use actual UD chunk size, not kRetrChunkSize
+        lkey = get_gpu_recv_chunk_lkey();
+        
+        // CRITICAL: Verify gpu_recv_chunk_size_ was initialized correctly
+        CHECK(gpu_recv_chunk_size_ > 0 && gpu_recv_chunk_size_ <= 4096)
+            << "BUG: gpu_recv_chunk_size_=" << gpu_recv_chunk_size_
+            << " is invalid! Should be MTU-40 (e.g., 4056 for MTU 4096)";
+        
+        // CRITICAL: Verify chunk_addr is valid
+        CHECK(chunk_addr != 0) << "BUG: pop_gpu_recv_chunk() returned NULL address!";
+        
+        if (i == 0) {
+          VLOG(2) << "UD GPU recv buffer: addr=0x" << std::hex << chunk_addr
+                  << std::dec << ", len=" << chunk_len << ", lkey=0x" << std::hex << lkey;
+        }
+      } else {
+        // UC uses CPU buffers
+        chunk_addr = pop_retr_chunk();
+        chunk_len = kRetrChunkSize;
+        lkey = get_retr_chunk_lkey();
+      }
+
+      if (is_ud_for_data()) {
+        // UD requires 2 SGEs: GRH buffer (40 bytes) + data buffer
+        // This matches how collective EFA works and fixes irdma driver issues
+        // CRITICAL: Use paired GRH buffer based on GPU buffer index to avoid reuse
+        uint64_t grh_buf = get_grh_buf_for_gpu_buf(chunk_addr);
+        
+        // SGE[0]: GRH header (40 bytes)
+        dp_recv_wrs_.ud_sge_arrays[i][0].addr = grh_buf;
+        dp_recv_wrs_.ud_sge_arrays[i][0].length = UD_ADDITION;  // 40 bytes
+        dp_recv_wrs_.ud_sge_arrays[i][0].lkey = ud_grh_lkey_;
+        
+        // SGE[1]: Data payload (4056 bytes)
+        dp_recv_wrs_.ud_sge_arrays[i][1].addr = chunk_addr;
+        dp_recv_wrs_.ud_sge_arrays[i][1].length = chunk_len;
+        dp_recv_wrs_.ud_sge_arrays[i][1].lkey = lkey;
+        
+        // CRITICAL: Validate buffer is within registered MR bounds
+        uint64_t mr_base = (uint64_t)gpu_recv_mr_->addr;
+        uint64_t mr_end = mr_base + gpu_recv_mr_->length;
+        uint64_t buf_end = chunk_addr + chunk_len;
+        
+        CHECK(chunk_addr >= mr_base && buf_end <= mr_end)
+            << "CRITICAL: Buffer 0x" << std::hex << chunk_addr 
+            << " (len=" << std::dec << chunk_len << ") is outside MR range [0x"
+            << std::hex << mr_base << ", 0x" << mr_end << ")"
+            << ", offset=" << std::dec << (chunk_addr - mr_base)
+            << ", lkey=0x" << std::hex << lkey << " vs MR lkey=0x" << gpu_recv_mr_->lkey;
+        
+        CHECK(lkey == gpu_recv_mr_->lkey)
+            << "CRITICAL: lkey mismatch! Using 0x" << std::hex << lkey 
+            << " but MR lkey is 0x" << gpu_recv_mr_->lkey;
+        
+        dp_recv_wrs_.recv_wrs[i].num_sge = 2;
+        dp_recv_wrs_.recv_wrs[i].sg_list = dp_recv_wrs_.ud_sge_arrays[i];
+        
+        if (i == 0) {
+          VLOG(2) << "UD SRQ WR[0]: SGE[0] addr=0x" << std::hex << grh_buf
+                  << ", len=" << std::dec << UD_ADDITION << ", lkey=0x" << std::hex << ud_grh_lkey_
+                  << "; SGE[1] addr=0x" << chunk_addr << ", len=" << std::dec << chunk_len
+                  << ", lkey=0x" << std::hex << lkey;
+        }
+      } else {
+        // UC uses single SGE
+        dp_recv_wrs_.recv_sges[i].addr = chunk_addr;
+        dp_recv_wrs_.recv_sges[i].length = chunk_len;
+        dp_recv_wrs_.recv_sges[i].lkey = lkey;
+        dp_recv_wrs_.recv_wrs[i].num_sge = 1;
+        dp_recv_wrs_.recv_wrs[i].sg_list = &dp_recv_wrs_.recv_sges[i];
+      }
+      
       dp_recv_wrs_.recv_wrs[i].next =
           (i == post_batch - 1) ? nullptr : &dp_recv_wrs_.recv_wrs[i + 1];
 
@@ -518,6 +593,7 @@ void SharedIOContext::check_srq(bool force) {
       cqe_desc->data = (uint64_t)chunk_addr;
       dp_recv_wrs_.recv_wrs[i].wr_id = (uint64_t)cqe_desc;
     } else {
+      // RC mode: No receive buffers needed
       dp_recv_wrs_.recv_wrs[i].num_sge = 0;
       dp_recv_wrs_.recv_wrs[i].sg_list = nullptr;
       dp_recv_wrs_.recv_wrs[i].next =
@@ -526,9 +602,38 @@ void SharedIOContext::check_srq(bool force) {
     }
   }
 
-  struct ibv_recv_wr* bad_wr;
-  CHECK(ibv_post_srq_recv(srq_, &dp_recv_wrs_.recv_wrs[0], &bad_wr) == 0);
-  // UCCL_LOG_IO << "Posted " << post_batch << " recv requests for SRQ";
+  struct ibv_recv_wr* bad_wr = nullptr;
+  int ret = ibv_post_srq_recv(srq_, &dp_recv_wrs_.recv_wrs[0], &bad_wr);
+  if (ret != 0) {
+    LOG(ERROR) << "ibv_post_srq_recv failed with errno=" << ret << " (" << strerror(ret) << ")";
+    LOG(ERROR) << "post_batch=" << post_batch << ", is_ud=" << is_ud_for_data()
+               << ", gpu_recv_chunk_size_=" << gpu_recv_chunk_size_;
+    
+    if (bad_wr) {
+      // Find which WR failed
+      int failed_idx = -1;
+      for (int i = 0; i < post_batch; i++) {
+        if (&dp_recv_wrs_.recv_wrs[i] == bad_wr) {
+          failed_idx = i;
+          break;
+        }
+      }
+      LOG(ERROR) << "Failed WR index: " << failed_idx;
+      if (failed_idx >= 0) {
+        LOG(ERROR) << "Failed WR num_sge=" << bad_wr->num_sge;
+        if (is_ud_for_data() && bad_wr->num_sge == 2) {
+          LOG(ERROR) << "  SGE[0]: addr=0x" << std::hex << dp_recv_wrs_.ud_sge_arrays[failed_idx][0].addr
+                     << ", length=" << std::dec << dp_recv_wrs_.ud_sge_arrays[failed_idx][0].length
+                     << ", lkey=0x" << std::hex << dp_recv_wrs_.ud_sge_arrays[failed_idx][0].lkey;
+          LOG(ERROR) << "  SGE[1]: addr=0x" << std::hex << dp_recv_wrs_.ud_sge_arrays[failed_idx][1].addr
+                     << ", length=" << std::dec << dp_recv_wrs_.ud_sge_arrays[failed_idx][1].length
+                     << ", lkey=0x" << std::hex << dp_recv_wrs_.ud_sge_arrays[failed_idx][1].lkey;
+        }
+      }
+    }
+    CHECK(false) << "ibv_post_srq_recv failed!";
+  }
+  
   dec_post_srq(post_batch);
 }
 
@@ -910,6 +1015,262 @@ int SharedIOContext::_uc_poll_recv_cq_normal(void) {
 
   for (auto rdma_ctx : rdma_ctxs) {
     rdma_ctx->uc_post_acks();
+  }
+
+  flush_acks();
+
+  return nr_wcs;
+}
+
+// UD-specific poll functions for data path
+int SharedIOContext::_ud_poll_send_cq_ex(void) {
+  // WORKAROUND: irdma driver bug with UD+SRQ+CQ_EX - poll send_cq for BOTH send and recv
+  // Discriminate by opcode: IBV_WC_SEND=0 vs IBV_WC_RECV=128
+  auto cq_ex = send_cq_ex_;
+  int cq_budget = 0;
+  int budget = kMaxBatchCQ << 1;
+
+  struct ibv_poll_cq_attr poll_cq_attr = {};
+  if (ibv_start_poll(cq_ex, &poll_cq_attr)) return 0;
+
+  std::vector<RDMAContext*> rdma_ctxs;
+  std::vector<CQEDesc*> recv_cqe_descs;  // For deferred return after sync
+  std::vector<uint64_t> recv_chunk_addrs;  // For deferred return after sync
+  static bool first_cqe = true;
+
+  while (1) {
+    if (cq_ex->status != IBV_WC_SUCCESS) {
+      auto qp_num = ibv_wc_read_qp_num(cq_ex);
+      auto opcode = ibv_wc_read_opcode(cq_ex);
+      auto vendor_err = ibv_wc_read_vendor_err(cq_ex);
+      LOG(ERROR) << "UD CQ error: status=" << cq_ex->status
+                 << ", QP=" << qp_num << ", opcode=" << opcode
+                 << ", vendor_err=" << vendor_err;
+      CHECK(false) << "UD CQ state error: " << cq_ex->status;
+    }
+
+    auto opcode = ibv_wc_read_opcode(cq_ex);
+    auto* cqe_desc = (CQEDesc*)cq_ex->wr_id;
+
+    if (first_cqe) {
+      auto qp_num = ibv_wc_read_qp_num(cq_ex);
+      LOG(INFO) << "UD FIRST CQE: opcode=" << opcode << " (IBV_WC_SEND=0, IBV_WC_RECV=128), QP=" << qp_num << ", CQ=" << cq_ex;
+      first_cqe = false;
+    }
+
+    if (opcode == IBV_WC_SEND) {
+      // Send completion
+      if (cqe_desc) {
+        // Distinguish between normal send and retransmission using type field
+        if (cqe_desc->type == 1) {
+          // Retransmission completion - free retr_hdr
+          auto retr_hdr = (uint64_t)cqe_desc->data;
+          push_retr_hdr(retr_hdr);
+        }
+        // Note: Normal send completions (type==0) contain wr_ex pointer
+        // The wr_ex is freed when timing wheel entry is removed or on ack
+        push_cqe_desc(cqe_desc);
+      }
+    } else if (opcode == IBV_WC_RECV) {
+      // Receive completion (on same CQ due to driver bug)
+      auto qp_num = ibv_wc_read_qp_num(cq_ex);
+      auto* rdma_ctx = qpn_to_rdma_ctx(qp_num);
+      auto chunk_addr = (uint64_t)cqe_desc->data;
+
+      static int recv_count = 0;
+      if (++recv_count <= 5) {
+        LOG(INFO) << "UD RECV #" << recv_count << ": QP=" << qp_num << ", chunk_addr=" << std::hex << chunk_addr << std::dec;
+      }
+
+      // UD: Both normal and retransmission arrive as IBV_WC_RECV in GPU buffer
+      rdma_ctx->ud_rx_chunk<struct ibv_cq_ex>(cq_ex);
+
+      rdma_ctxs.push_back(rdma_ctx);
+      recv_cqe_descs.push_back(cqe_desc);  // Save for later
+      recv_chunk_addrs.push_back(chunk_addr);  // Save for later
+    } else {
+      LOG(FATAL) << "UD CQ unexpected opcode: " << opcode;
+    }
+
+    if (++cq_budget == budget || ibv_next_poll(cq_ex)) break;
+  }
+
+  ibv_end_poll(cq_ex);
+
+  // CRITICAL: Sync BEFORE returning buffers
+  if (!rdma_ctxs.empty()) {
+#ifndef __HIP_PLATFORM_AMD__
+    cudaStreamSynchronize(0);
+#else
+    hipStreamSynchronize(0);
+#endif
+
+    // NOW safe to return buffers after sync
+    for (size_t i = 0; i < recv_chunk_addrs.size(); i++) {
+      push_gpu_recv_chunk(recv_chunk_addrs[i]);
+      push_cqe_desc(recv_cqe_descs[i]);
+      inc_post_srq();
+    }
+  }
+
+  // Post recv WRs back to SRQ if we handled any receives
+  if (!rdma_ctxs.empty()) {
+    check_srq(false);
+
+    // Post ACKs for all flows that received data
+    for (auto rdma_ctx : rdma_ctxs) {
+      rdma_ctx->ud_post_acks();
+    }
+
+    flush_acks();
+  }
+
+  return cq_budget;
+}
+
+int SharedIOContext::_ud_poll_recv_cq_ex(void) {
+  // WORKAROUND: irdma driver bug - don't poll recv_cq, all completions on send_cq
+  // This function is now a no-op, all work done in _ud_poll_send_cq_ex
+  return 0;
+}
+
+int SharedIOContext::_ud_poll_send_cq_normal(void) {
+  struct ibv_wc wcs[kMaxBatchCQ];
+  auto* cq = ibv_cq_ex_to_cq(send_cq_ex_);
+  int nr_wcs = ibv_poll_cq(cq, kMaxBatchCQ, wcs);
+
+  for (int i = 0; i < nr_wcs; i++) {
+    auto* wc = wcs + i;
+    DCHECK(wc->status == IBV_WC_SUCCESS)
+        << "UD send CQ state error: " << wc->status;
+    auto* cqe_desc = (CQEDesc*)wc->wr_id;
+    auto opcode = wc->opcode;
+
+    // Send CQ should only see send completions
+    DCHECK(opcode == IBV_WC_SEND) << "UD send_cq unexpected opcode: " << opcode
+                                   << " (expected IBV_WC_SEND=0)";
+
+    if (cqe_desc) {
+      if (cqe_desc->type == 1) {
+        // Retransmission completion
+        auto retr_hdr = (uint64_t)cqe_desc->data;
+        push_retr_hdr(retr_hdr);
+      }
+      push_cqe_desc(cqe_desc);
+    }
+  }
+
+  return nr_wcs;
+}
+
+int SharedIOContext::_ud_poll_recv_cq_normal(void) {
+  struct ibv_wc wcs[kMaxBatchCQ];
+  auto* cq = ibv_cq_ex_to_cq(recv_cq_ex_);
+  int nr_wcs = ibv_poll_cq(cq, kMaxBatchCQ, wcs);
+
+  std::vector<RDMAContext*> rdma_ctxs;
+  int successful_wcs = 0;
+
+  for (int i = 0; i < nr_wcs; i++) {
+    auto* wc = wcs + i;
+    if (wc->status != IBV_WC_SUCCESS) {
+      auto* cqe_desc = (CQEDesc*)wc->wr_id;
+      auto chunk_addr = (uint64_t)cqe_desc->data;
+      
+      LOG(ERROR) << "UD recv CQ error - status: " << wc->status
+                 << " (" << ibv_wc_status_str(wc->status) << ")"
+                 << ", vendor_err: " << wc->vendor_err << " (0x" << std::hex << wc->vendor_err << ")"
+                 << ", qp_num: " << std::dec << wc->qp_num
+                 << ", opcode: " << wc->opcode
+                 << ", byte_len: " << wc->byte_len
+                 << ", wr_id: 0x" << std::hex << wc->wr_id
+                 << ", chunk_addr: 0x" << chunk_addr
+                 << ", recv_cq=" << std::dec << (void*)recv_cq_ex_
+                 << ", srq_posted=" << (kMaxSRQ - get_post_srq_cnt());
+      
+      // Provide detailed diagnostics for buffer management bugs
+      uint64_t chunk_offset = chunk_addr - (uint64_t)gpu_recv_buf_;
+      uint32_t buffer_index = chunk_offset / gpu_recv_chunk_size_;
+      uint64_t page_base = chunk_addr & ~0xFFFULL;  // 4KB page alignment
+      uint64_t offset_in_page = chunk_addr & 0xFFFULL;
+      
+      LOG(ERROR) << "Buffer state: gpu_recv_chunk_size_=" << gpu_recv_chunk_size_
+                 << ", gpu_recv_buf_base=0x" << std::hex << (uint64_t)gpu_recv_buf_
+                 << ", chunk_offset=" << std::dec << chunk_offset
+                 << ", buffer_index=" << buffer_index
+                 << ", page_base=0x" << std::hex << page_base
+                 << ", offset_in_page=" << std::dec << offset_in_page
+                 << ", alignment=" << (chunk_addr % 64) << "B";
+      
+      LOG(ERROR) << "MR info: addr=0x" << std::hex << (uint64_t)gpu_recv_mr_->addr
+                 << ", length=" << std::dec << gpu_recv_mr_->length
+                 << ", lkey=0x" << std::hex << gpu_recv_mr_->lkey
+                 << ", rkey=0x" << gpu_recv_mr_->rkey;
+      
+      push_gpu_recv_chunk(chunk_addr);
+      push_cqe_desc(cqe_desc);
+      inc_post_srq();
+      
+      // vendor_err 131073 (0x20001) is an Intel irdma driver error
+      // Likely causes:
+      // 1. GPU managed memory (cudaMallocManaged) not fully supported by irdma for DMA
+      // 2. Driver bug with specific buffer indices or alignments
+      // 3. Memory access violation at driver/hardware level
+      LOG(FATAL) << "Intel irdma vendor_err 131073 at buffer_index=" << buffer_index
+                 << " - This appears to be an irdma driver bug with GPU managed memory."
+                 << " Consider using regular GPU memory (cudaMalloc) instead of cudaMallocManaged,"
+                 << " or switching to per-QP RQ instead of SRQ (like collective/efa)";
+    }
+    
+    // Process successful completion
+    auto* cqe_desc = (CQEDesc*)wc->wr_id;
+    auto* rdma_ctx = qpn_to_rdma_ctx(wc->qp_num);
+    auto chunk_addr = (uint64_t)cqe_desc->data;
+    auto opcode = wc->opcode;
+
+    // Recv CQ should only see receive completions
+    DCHECK(opcode == IBV_WC_RECV) << "UD recv_cq unexpected opcode: " << opcode
+                                   << " (expected IBV_WC_RECV=128)";
+
+    // UD: Both normal and retransmission arrive as IBV_WC_RECV in GPU buffer
+    rdma_ctx->ud_rx_chunk<struct ibv_wc>(wc);
+
+    rdma_ctxs.push_back(rdma_ctx);
+    successful_wcs++;
+
+    // Store buffer info for later return (after sync)
+    // We'll return buffers after GPU sync completes
+  }
+
+  // CRITICAL: Sync BEFORE returning buffers to ensure GPU copies complete
+  // If we return buffers first, check_srq() immediately reposts them and they get
+  // overwritten while the GPU copy is still in flight!
+  if (successful_wcs > 0) {
+#ifndef __HIP_PLATFORM_AMD__
+    cudaStreamSynchronize(0);
+#else
+    hipStreamSynchronize(0);
+#endif
+
+    // NOW safe to return buffers after sync
+    for (int i = 0; i < nr_wcs; i++) {
+      auto* wc = wcs + i;
+      if (wc->status != IBV_WC_SUCCESS) continue;  // Already handled in error path above
+      auto* cqe_desc = (CQEDesc*)wc->wr_id;
+      auto chunk_addr = (uint64_t)cqe_desc->data;
+      
+      push_gpu_recv_chunk(chunk_addr);
+      push_cqe_desc(cqe_desc);
+      inc_post_srq();  // CRITICAL: Must increment to trigger check_srq()
+    }
+  }
+
+  // Post recv WRs back to SRQ
+  check_srq(false);
+
+  // Post ACKs for all flows that received data
+  for (auto rdma_ctx : rdma_ctxs) {
+    rdma_ctx->ud_post_acks();
   }
 
   flush_acks();

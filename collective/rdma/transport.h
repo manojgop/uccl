@@ -140,6 +140,7 @@ class IMMData {
   constexpr static int kRESERVED = kCSN + UINT_CSN_BIT;
   constexpr static int kHINT = kRESERVED + 8;
 
+  IMMData() : imm_data_(0) {}
   IMMData(uint32_t imm_data) : imm_data_(imm_data) {}
 
   inline uint32_t GetHINT(void) { return (imm_data_ >> kHINT) & 0x1; }
@@ -310,6 +311,10 @@ class RDMAContext {
     nr_flows_++;
   }
 
+  inline uint32_t get_port_entropy() const {
+    return port_entropy_;
+  }
+
   eqds::PacerCreditQPWrapper pc_qpw_;
 
   // Try to arm a timer for the given flow. If the timer is already armed, do
@@ -404,6 +409,18 @@ class RDMAContext {
   template <typename T>
   void uc_rx_rtx_chunk(T* wc_or_cq_ex, uint64_t chunk_addr);
 
+  // UD-specific functions for application-level reliability
+  void ud_post_acks();
+
+  template <typename T>
+  void ud_rx_chunk(T* wc_or_cq_ex);
+
+  template <typename T>
+  void ud_rx_ack(T* wc_or_cq_ex, UcclSackHdr* ucclsackh);
+
+  template <typename T>
+  void ud_rx_rtx_chunk(T* wc_or_cq_ex, uint64_t chunk_addr);
+
   /**
    * @brief Receive a credit.
    * @param pkt_addr The position of the Credit packet in the Credit chunk.
@@ -428,17 +445,31 @@ class RDMAContext {
     if constexpr (kReceiverCCA != RECEIVER_CCA_NONE) {
       return receiverCC_tx_message(ureq);
     } else {
-      if (ureq->type == ReqRead)
-        return senderCC_tx_read(ureq);
-      else if (ureq->type == ReqWrite)
-        return senderCC_tx_write(ureq);
-      return senderCC_tx_message(ureq);
+      // Check if UD mode is enabled
+      if (io_ctx_->is_ud_for_data()) {
+        if (ureq->type == ReqRead)
+          return ud_senderCC_tx_read(ureq);
+        else if (ureq->type == ReqWrite)
+          return ud_senderCC_tx_write(ureq);
+        return ud_senderCC_tx_message(ureq);
+      } else {
+        if (ureq->type == ReqRead)
+          return senderCC_tx_read(ureq);
+        else if (ureq->type == ReqWrite)
+          return senderCC_tx_write(ureq);
+        return senderCC_tx_message(ureq);
+      }
     }
   }
   bool receiverCC_tx_message(struct ucclRequest* ureq);
   bool senderCC_tx_message(struct ucclRequest* ureq);
   bool senderCC_tx_read(struct ucclRequest* ureq);
   bool senderCC_tx_write(struct ucclRequest* ureq);
+
+  // UD-specific TX functions (using SEND/RECV instead of RDMA READ/WRITE)
+  bool ud_senderCC_tx_message(struct ucclRequest* ureq);
+  bool ud_senderCC_tx_read(struct ucclRequest* ureq);
+  bool ud_senderCC_tx_write(struct ucclRequest* ureq);
 
   virtual uint32_t EventOnSelectPath(SubUcclFlow* subflow,
                                      uint32_t chunk_size) = 0;

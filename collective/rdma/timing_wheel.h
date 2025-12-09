@@ -27,6 +27,8 @@ struct alignas(64) wr_ex {
 
   struct ucclRequest* ureq;
   uint32_t qpidx;
+  uint32_t dest_offset;  // For UD: byte offset in receiver's buffer
+  uint32_t padding;      // Keep 64-byte alignment
 };
 static_assert(sizeof(wr_ex) == 192, "wr_ex size mismatch");
 
