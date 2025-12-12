@@ -22,7 +22,8 @@ static constexpr int kNumThBlocks = 4;
 static constexpr int kNumThPerBlock = 512;
 
 // Yang: 64 max scattered IOVs
-#define kMaxIovs 64
+// Increase from 64 to 256 for all gather tests to pass using Intel RDMA NIC with MTU size 4096
+#define kMaxIovs 256 //64
 // proxy.h: NCCL_PROXY_MAX_SUBS = 32, NCCL_STEPS = 8; double provisioning
 static constexpr int kFifoCap = 32 * 8 / kNumThBlocks * 2;
 static constexpr uint64_t kAbortTailValue = (uint64_t)-2;

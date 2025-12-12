@@ -337,19 +337,12 @@ class Primitives<
 
           int iov_idx = (step - StepPerSlice) % NCCL_STEPS;
           struct iov *cur_iov_hbm = (struct iov *)((char *)tail_ptr + kIovStart + iov_idx * kIovSize);
-          struct iov *cur_iov_shmem = &ncclShmem.groups[group].cur_iovs;
-
-          // Yang: single thread load iov to sharemem.
-          cur_iov_shmem->iov_n = ncclShmem.groups[group].iov_ns[t];
-          if (tid < cur_iov_shmem->iov_n) {
-            int i = tid;
-            cur_iov_shmem->src_addrs[i] = (void*)loadInt64((int64_t*)(cur_iov_hbm->src_addrs + i));
-            cur_iov_shmem->dst_addrs[i] = (void*)loadInt64((int64_t*)(cur_iov_hbm->dst_addrs + i));
-            cur_iov_shmem->iov_lens[i] = loadInt(cur_iov_hbm->iov_lens + i);
-          }
+          // Yang: Use HBM iov directly to avoid shared memory overflow
+          ncclShmem.groups[group].cur_iovs = cur_iov_hbm;
+          ncclShmem.groups[group].cur_iovs->iov_n = ncclShmem.groups[group].iov_ns[t];
           barrier();
 
-          kernelScatteredMemcpy(cur_iov_shmem);
+          kernelScatteredMemcpy(ncclShmem.groups[group].cur_iovs);
 
           // Yang: debuging
           // if (tid == 0) {
@@ -1202,25 +1195,19 @@ private:
 
         int iov_idx = step % NCCL_STEPS;
         struct iov *cur_iov_hbm = (struct iov *)((char *)tail_ptr + kIovStart + iov_idx * kIovSize);
-        struct iov *cur_iov_shmem = &ncclShmem.groups[group].cur_iovs;
-        
-        cur_iov_shmem->iov_n = ncclShmem.groups[group].iov_ns[t];
-        if (tid < cur_iov_shmem->iov_n) {
-          int i = tid;
-          cur_iov_shmem->src_addrs[i] = (void*)loadInt64((int64_t*)(cur_iov_hbm->src_addrs + i));
-          cur_iov_shmem->dst_addrs[i] = (void*)loadInt64((int64_t*)(cur_iov_hbm->dst_addrs + i));
-          cur_iov_shmem->iov_lens[i] = loadInt(cur_iov_hbm->iov_lens + i);
-        }
+        // Yang: Use HBM iov directly to avoid shared memory overflow
+        ncclShmem.groups[group].cur_iovs = cur_iov_hbm;
+        ncclShmem.groups[group].cur_iovs->iov_n = ncclShmem.groups[group].iov_ns[t];
         barrier();
 
-        kernelScatteredMemcpy(cur_iov_shmem);
+        kernelScatteredMemcpy(ncclShmem.groups[group].cur_iovs);
 
         // Yang: debuging
         // if (tid == 0) {
-        //   int step_recv = cur_iov_shmem->step;
+        //   int step_recv = ncclShmem.groups[group].cur_iovs->step;
         //   uint64_t gpu_idx = loadStepValue(tail_ptr + 1);
         //   uint64_t cpu_tail = loadStepValue(tail_ptr);
-        //   printf("[padReduce %ld]: step %ld connStepPtr %p cpu_tail %ld step_recv %d iov_n %d src[0] %p dst[0] %p len %d t %d recvPow2 %d sendPow2 %d index %d srcs[0] %p dsts[0] %p nDsts %d workSize %d postRecv %d\n", gpu_idx, step, tail_ptr, cpu_tail, step_recv, cur_iov_shmem->iov_n, cur_iov_shmem->src_addrs[0], cur_iov_shmem->dst_addrs[0], cur_iov_shmem->iov_lens[0], t, recvPow2, sendPow2, index, ncclShmem.groups[group].srcs[0], ncclShmem.groups[group].dsts[0], nDsts, workSize, postRecv);
+        //   printf("[padReduce %ld]: step %ld connStepPtr %p cpu_tail %ld step_recv %d iov_n %d src[0] %p dst[0] %p len %d t %d recvPow2 %d sendPow2 %d index %d srcs[0] %p dsts[0] %p nDsts %d workSize %d postRecv %d\n", gpu_idx, step, tail_ptr, cpu_tail, step_recv, ncclShmem.groups[group].cur_iovs->iov_n, ncclShmem.groups[group].cur_iovs->src_addrs[0], ncclShmem.groups[group].cur_iovs->dst_addrs[0], ncclShmem.groups[group].cur_iovs->iov_lens[0], t, recvPow2, sendPow2, index, ncclShmem.groups[group].srcs[0], ncclShmem.groups[group].dsts[0], nDsts, workSize, postRecv);
         // }
       }
     }
@@ -1327,25 +1314,19 @@ private:
 
         int iov_idx = step % NCCL_STEPS;
         struct iov *cur_iov_hbm = (struct iov *)((char *)tail_ptr + kIovStart + iov_idx * kIovSize);
-        struct iov *cur_iov_shmem = &ncclShmem.groups[group].cur_iovs;
-        
-        cur_iov_shmem->iov_n = ncclShmem.groups[group].iov_ns[t];
-        if (tid < cur_iov_shmem->iov_n) {
-          int i = tid;
-          cur_iov_shmem->src_addrs[i] = (void*)loadInt64((int64_t*)(cur_iov_hbm->src_addrs + i));
-          cur_iov_shmem->dst_addrs[i] = (void*)loadInt64((int64_t*)(cur_iov_hbm->dst_addrs + i));
-          cur_iov_shmem->iov_lens[i] = loadInt(cur_iov_hbm->iov_lens + i);
-        }
+        // Yang: Use HBM iov directly to avoid shared memory overflow
+        ncclShmem.groups[group].cur_iovs = cur_iov_hbm;
+        ncclShmem.groups[group].cur_iovs->iov_n = ncclShmem.groups[group].iov_ns[t];
         barrier();
 
-        kernelScatteredMemcpy(cur_iov_shmem);
+        kernelScatteredMemcpy(ncclShmem.groups[group].cur_iovs);
 
         // Yang: debuging
         // if (tid == 0) {
-        //   int step_recv = cur_iov_shmem->step;
+        //   int step_recv = ncclShmem.groups[group].cur_iovs->step;
         //   uint64_t gpu_idx = loadStepValue(tail_ptr + 1);
         //   uint64_t cpu_tail = loadStepValue(tail_ptr);
-        //   printf("[padCopy %ld]: step %ld connStepPtr %p cpu_tail %ld step_recv %d iov_n %d src[0] %p dst[0] %p len %d t %d recvPow2 %d sendPow2 %d index %d srcs[0] %p dsts[0] %p nDsts %d workSize %d postRecv %d\n", gpu_idx, step, tail_ptr, cpu_tail, step_recv, cur_iov_shmem->iov_n, cur_iov_shmem->src_addrs[0], cur_iov_shmem->dst_addrs[0], cur_iov_shmem->iov_lens[0], t, recvPow2, sendPow2, index, ncclShmem.groups[group].srcs[0], ncclShmem.groups[group].dsts[0], nDsts, workSize, postRecv);
+        //   printf("[padCopy %ld]: step %ld connStepPtr %p cpu_tail %ld step_recv %d iov_n %d src[0] %p dst[0] %p len %d t %d recvPow2 %d sendPow2 %d index %d srcs[0] %p dsts[0] %p nDsts %d workSize %d postRecv %d\n", gpu_idx, step, tail_ptr, cpu_tail, step_recv, ncclShmem.groups[group].cur_iovs->iov_n, ncclShmem.groups[group].cur_iovs->src_addrs[0], ncclShmem.groups[group].cur_iovs->dst_addrs[0], ncclShmem.groups[group].cur_iovs->iov_lens[0], t, recvPow2, sendPow2, index, ncclShmem.groups[group].srcs[0], ncclShmem.groups[group].dsts[0], nDsts, workSize, postRecv);
         // }
       }
     }
