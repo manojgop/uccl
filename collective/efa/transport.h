@@ -65,7 +65,8 @@ class PollCtxPool : public BuffPool {
   ~PollCtxPool() = default;
 };
 
-int const kMaxIovs = 64;
+// Increase from 64 to 256 for all gather tests to pass using Intel RDMA NIC with MTU size 4096
+int const kMaxIovs = 256; // 64
 
 enum ReqType {
   ReqTx,

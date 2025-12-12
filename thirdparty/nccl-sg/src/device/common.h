@@ -47,8 +47,8 @@ struct ncclShmemGroup {
   bool is_net_transfer[MAX_TIDS];
   // Yang: iov_n is the number of iovs for each group
   int iov_ns[MAX_TIDS];
-  // Yang: loaded by a single thread
-  struct iov cur_iovs;
+  // Yang: loaded by a single thread - POINTER to avoid shared memory overflow
+  struct iov* cur_iovs;
 };
 
 struct ncclShmemData {

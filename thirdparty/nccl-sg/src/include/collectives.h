@@ -66,7 +66,8 @@ struct ncclConnFifo {
 };
 
 // Yang: 64 max scattered IOVs
-#define kMaxIovs 64
+// Increase from 64 to 256 for all gather tests to pass using Intel RDMA NIC with MTU size 4096
+#define kMaxIovs 256 // 64
 struct alignas(8) iov {
   void* src_addrs[kMaxIovs];
   void* dst_addrs[kMaxIovs];
