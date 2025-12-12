@@ -22,7 +22,8 @@ static constexpr int kNumThBlocks = 4;
 static constexpr int kNumThPerBlock = 512;
 
 // Yang: 64 max scattered IOVs
-#define kMaxIovs 64
+// Increase from 64 to 256 for all gather tests to pass using Intel RDMA NIC with MTU size 4096
+#define kMaxIovs 256 //64
 
 // Use shared memory for IOV when kMaxIovs is <= 64, otherwise use HBM pointer to avoid shared memory overflow
 #if kMaxIovs <= 64
