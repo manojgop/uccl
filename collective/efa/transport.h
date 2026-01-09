@@ -419,17 +419,23 @@ class UcclFlow {
         channel_(channel),
         flow_id_(flow_id),
         pcb_(),
-        cubic_g_(),
+#if USE_TIMING_WHEEL
         timely_g_(),
+#endif
+        cubic_g_(),
         tx_tracking_(socket, channel),
         rx_tracking_(socket, channel, active_flows_map_),
         is_sender_(is_sender),
         eqds_cc_() {
     // Initing per-flow CC states.
+#if USE_TIMING_WHEEL
     timely_g_.init(&pcb_);
+#endif
     if constexpr (kSenderCCType == SenderCCType::kTimelyPP) {
+#if USE_TIMING_WHEEL
       timely_pp_ = new swift::TimelyCtl[kMaxPath];
       for (uint32_t i = 0; i < kMaxPath; i++) timely_pp_[i].init(&pcb_);
+#endif
     }
 
     cubic_g_.init(&pcb_, kMaxUnackedPktsPerEngine);
@@ -450,7 +456,9 @@ class UcclFlow {
   ~UcclFlow() {
     delete local_meta_;
     delete remote_meta_;
+#if USE_TIMING_WHEEL
     if constexpr (kSenderCCType == SenderCCType::kTimelyPP) delete[] timely_pp_;
+#endif
     if constexpr (kSenderCCType == SenderCCType::kCubicPP) delete[] cubic_pp_;
   }
 
@@ -623,10 +631,14 @@ class UcclFlow {
 
   // Swift reliable transmission control block.
   swift::Pcb pcb_;
+#if USE_TIMING_WHEEL
   swift::TimelyCtl timely_g_;
+#endif
   swift::CubicCtl cubic_g_;
   // Each path has its own PCB for CC.
+#if USE_TIMING_WHEEL
   swift::TimelyCtl* timely_pp_;
+#endif
   swift::CubicCtl* cubic_pp_;
   // Peer flow_id used for communication.
   FlowID peer_flow_id_ = 0;

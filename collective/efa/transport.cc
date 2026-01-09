@@ -502,9 +502,11 @@ std::string UcclFlow::to_string() const {
   s += "\n\t\t\t[CC] pcb:         " + pcb_.to_string() +
        (kSenderCCType == SenderCCType::kCubicPP
             ? "\n\t\t\t     cubic_pp[0]: " + cubic_pp_[0].to_string()
-            : "\n\t\t\t     cubic:       " + cubic_g_.to_string()) +
-       "\n\t\t\t     timely:      " + timely_g_.to_string() +
-       "\n\t\t\t[TX] msgbufs unsent: " +
+            : "\n\t\t\t     cubic:       " + cubic_g_.to_string());
+#if USE_TIMING_WHEEL
+  s += "\n\t\t\t     timely:      " + timely_g_.to_string();
+#endif
+  s += "\n\t\t\t[TX] msgbufs unsent: " +
        std::to_string(tx_tracking_.num_unsent_msgbufs()) +
        "\n\t\t\t[RX] msgbufs unconsumed: " +
        std::to_string(rx_tracking_.num_unconsumed_msgbufs());
@@ -663,19 +665,25 @@ void UcclFlow::process_rttprobe_rsp(uint64_t ts1, uint64_t ts2, uint64_t ts3,
   auto sample_rtt_tsc = sender_latency - receiver_latency;
   port_path_rtt_[path_id] = sample_rtt_tsc;
 
+#if USE_TIMING_WHEEL
   if constexpr (kSenderCCType == SenderCCType::kTimely) {
     timely_g_.timely_update_rate(rdtsc(), sample_rtt_tsc);
   }
+#endif
+#if USE_TIMING_WHEEL
   if constexpr (kSenderCCType == SenderCCType::kTimelyPP) {
     timely_pp_[path_id].timely_update_rate(rdtsc(), sample_rtt_tsc);
   }
+#endif
 
+#if USE_TIMING_WHEEL
   VLOG(3) << "sample_rtt_us " << to_usec(sample_rtt_tsc, freq_ghz)
           << " us, avg_rtt_diff " << timely_g_.timely_.get_avg_rtt_diff()
           << " us, timely rate " << timely_g_.timely_.get_rate_gbps()
           << " Gbps, "
           << "ts1 " << ts1 << " ts2 " << ts2 << " ts3 " << ts3 << " ts4 "
           << ts4;
+#endif
 
 #ifdef RTT_STATS
   rtt_stats_.update(rtt_ns / 1000);
@@ -967,6 +975,7 @@ uint32_t UcclFlow::transmit_pending_packets(uint32_t budget) {
 
   permitted_packets = hard_budget;
 
+#if USE_TIMING_WHEEL
   if constexpr (kSenderCCType == SenderCCType::kTimely ||
                 kSenderCCType == SenderCCType::kTimelyPP) {
     if constexpr (kReceiverCCType != ReceiverCCType::kNone) {
@@ -975,6 +984,7 @@ uint32_t UcclFlow::transmit_pending_packets(uint32_t budget) {
     } else
       permitted_packets = timely_g_.timely_pop_ready_packets(hard_budget);
   }
+#endif
   if constexpr (kSenderCCType == SenderCCType::kCubic) {
     permitted_packets =
         std::min(permitted_packets, cubic_g_.cubic_effective_wnd());
@@ -993,6 +1003,7 @@ uint32_t UcclFlow::transmit_pending_packets(uint32_t budget) {
       permitted_packets = 0;
     }
 
+#if USE_TIMING_WHEEL
     if constexpr (kSenderCCType == SenderCCType::kTimely ||
                   kSenderCCType == SenderCCType::kTimelyPP) {
       if (permitted_packets) {
@@ -1002,6 +1013,7 @@ uint32_t UcclFlow::transmit_pending_packets(uint32_t budget) {
         DCHECK(old_check_v == permitted_packets);
       }
     }
+#endif
   }
 
   // static uint64_t transmit_tries = 0;
@@ -1111,9 +1123,11 @@ void UcclFlow::deserialize_and_append_to_txtracking() {
   size_t remaining_bytes = tx_work.len - cur_offset;
 
   uint32_t path_id = kMaxPath;
+#if USE_TIMING_WHEEL
   if constexpr (kSenderCCType == SenderCCType::kTimelyPP) {
     path_id = get_path_id_with_lowest_rtt();
   }
+#endif
 
   auto now_tsc = rdtsc();
   while (cur_msgbuf != nullptr && num_tx_frames < deser_budget) {
@@ -1124,6 +1138,7 @@ void UcclFlow::deserialize_and_append_to_txtracking() {
 
     auto payload_len = cur_msgbuf->get_pkt_data_len();
 
+#if USE_TIMING_WHEEL
     // Both queue on one timing wheel.
     if constexpr (kSenderCCType == SenderCCType::kTimely) {
       timely_g_.timely_pace_packet(now_tsc, payload_len + kUcclPktHdrLen,
@@ -1139,6 +1154,7 @@ void UcclFlow::deserialize_and_append_to_txtracking() {
       timely_g_.timely_pace_packet_with_rate(
           now_tsc, payload_len + kUcclPktHdrLen, cur_msgbuf, rate);
     }
+#endif
 
     remaining_bytes -= payload_len;
     if (remaining_bytes == 0) {

@@ -12,6 +12,23 @@
 // #define RTT_STATS
 #define LAZY_CREATE_ENGINE
 
+// Congestion Control Type Configuration
+// Define which CC type to use (uncomment ONE):
+// #define CC_TYPE_NONE 1
+// #define CC_TYPE_TIMELY 1
+// #define CC_TYPE_TIMELY_PP 1
+#define CC_TYPE_CUBIC 1
+// #define CC_TYPE_CUBIC_PP 1
+
+// TimingWheel is only needed for Timely and TimelyPP (rate-based pacing)
+// Cubic and CubicPP use window-based control and don't need it
+#if defined(CC_TYPE_TIMELY) || defined(CC_TYPE_TIMELY_PP)
+#define USE_TIMING_WHEEL 1
+#else
+#define USE_TIMING_WHEEL 0
+#endif
+
+// Map to enum values for C++ code
 enum class SenderCCType {
   kNone,
   kTimely,
@@ -23,7 +40,19 @@ enum class ReceiverCCType {
   kNone,
   kEQDS,
 };
+
+#if defined(CC_TYPE_NONE)
+static constexpr SenderCCType kSenderCCType = SenderCCType::kNone;
+#elif defined(CC_TYPE_TIMELY)
+static constexpr SenderCCType kSenderCCType = SenderCCType::kTimely;
+#elif defined(CC_TYPE_TIMELY_PP)
+static constexpr SenderCCType kSenderCCType = SenderCCType::kTimelyPP;
+#elif defined(CC_TYPE_CUBIC)
 static constexpr SenderCCType kSenderCCType = SenderCCType::kCubic;
+#elif defined(CC_TYPE_CUBIC_PP)
+static constexpr SenderCCType kSenderCCType = SenderCCType::kCubicPP;
+#endif
+
 static constexpr ReceiverCCType kReceiverCCType = ReceiverCCType::kNone;
 static_assert(
     kSenderCCType != SenderCCType::kNone ||
