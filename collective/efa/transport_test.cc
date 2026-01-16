@@ -1,5 +1,6 @@
 #include "transport.h"
 #include "transport_config.h"
+#include "util/util.h"
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <chrono>
@@ -26,43 +27,13 @@ DEFINE_uint64(size, 1024000, "Size of test message.");
 DEFINE_uint64(infly, 8, "Max num of test messages in the flight.");
 DEFINE_string(serverip, "", "Server IP address the client tries to connect.");
 DEFINE_string(clientip, "", "Client IP address the server tries to connect.");
+DEFINE_uint32(oobport, 19999, "Out-of-band TCP port for bootstrapping and port exchange.");
 DEFINE_bool(verify, false, "Whether to check data correctness.");
 DEFINE_bool(rand, false, "Whether to use randomized data length.");
 DEFINE_string(
     test, "basic",
     "Which test to run: basic, async, pingpong, mt (multi-thread), "
     "mc (multi-connection), mq (multi-queue), bimq (bi-directional mq), tput.");
-
-// Helper function to exchange listen ports over bootstrap connection (test-only)
-static std::vector<uint16_t> exchange_listen_ports_test(
-    int bootstrap_fd, const std::vector<uint16_t>& local_ports) {
-  // Send the number of listen ports we have
-  uint32_t num_local_ports = local_ports.size();
-  ssize_t ret = send(bootstrap_fd, &num_local_ports, sizeof(uint32_t), 0);
-  CHECK(ret == sizeof(uint32_t)) << "Failed to send num_local_ports";
-
-  // Receive the number of remote listen ports
-  uint32_t num_remote_ports = 0;
-  ret = recv(bootstrap_fd, &num_remote_ports, sizeof(uint32_t), MSG_WAITALL);
-  CHECK(ret == sizeof(uint32_t)) << "Failed to receive num_remote_ports";
-
-  // Send our listen ports
-  ret = send(bootstrap_fd, local_ports.data(),
-             num_local_ports * sizeof(uint16_t), 0);
-  CHECK(ret == (ssize_t)(num_local_ports * sizeof(uint16_t)))
-      << "Failed to send listen ports";
-
-  // Receive remote listen ports
-  std::vector<uint16_t> remote_ports(num_remote_ports);
-  ret = recv(bootstrap_fd, remote_ports.data(),
-             num_remote_ports * sizeof(uint16_t), MSG_WAITALL);
-  CHECK(ret == (ssize_t)(num_remote_ports * sizeof(uint16_t)))
-      << "Failed to receive remote listen ports";
-
-  LOG(INFO) << "[Test] exchanged listen ports: local=" << num_local_ports
-            << ", remote=" << num_remote_ports;
-  return remote_ports;
-}
 
 enum TestType { kBasic, kAsync, kPingpong, kMt, kMc, kMq, kBiMq, kTput };
 
@@ -127,11 +98,16 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < kMaxArraySize; i++) ep.uccl_listen();
 
-    conn_id = ep.uccl_connect(0, 0, FLAGS_serverip, ep.listen_port_vec_[0]);
-    
-    // Exchange listen ports with the server so we can connect to the correct ports
-    std::vector<uint16_t> remote_listen_ports = 
-        exchange_listen_ports_test(conn_id.boostrap_id, ep.listen_port_vec_);
+    // Exchange listen ports with server via out-of-band TCP connection
+    std::vector<uint16_t> remote_listen_ports(kMaxArraySize);
+    LOG(INFO) << "[Client] Exchanging listen ports via OOB connection on port " << FLAGS_oobport;
+    connect_exchange(FLAGS_oobport, FLAGS_serverip, ep.listen_port_vec_.data(),
+                     ep.listen_port_vec_.size() * sizeof(uint16_t),
+                     remote_listen_ports.data(),
+                     kMaxArraySize * sizeof(uint16_t));
+    LOG(INFO) << "[Client] Received server ports, connecting to first port: " << remote_listen_ports[0];
+
+    conn_id = ep.uccl_connect(0, 0, FLAGS_serverip, remote_listen_ports[0]);
     
     if (test_type == kMc) {
       conn_id_vec[0] = conn_id;
@@ -412,12 +388,19 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < kMaxArraySize; i++) ep.uccl_listen();
 
+    // Exchange listen ports with client via out-of-band TCP connection
+    std::vector<uint16_t> remote_listen_ports(kMaxArraySize);
+    LOG(INFO) << "[Server] Listening for OOB connection on port " << FLAGS_oobport;
+    LOG(INFO) << "[Server] My listen ports: " << ep.listen_port_vec_[0]
+              << " (use this for reference, but client will get all ports via OOB)";
+    listen_accept_exchange(FLAGS_oobport, ep.listen_port_vec_.data(),
+                           ep.listen_port_vec_.size() * sizeof(uint16_t),
+                           remote_listen_ports.data(),
+                           kMaxArraySize * sizeof(uint16_t));
+    LOG(INFO) << "[Server] Exchanged ports with client, waiting for connection...";
+
     conn_id =
         ep.uccl_accept(0, &remote_vdevs[0], remote_ip[0], ep.listen_fd_vec_[0]);
-    
-    // Exchange listen ports with the client so they can connect to the correct ports
-    std::vector<uint16_t> remote_listen_ports = 
-        exchange_listen_ports_test(conn_id.boostrap_id, ep.listen_port_vec_);
     
     if (test_type == kMc) {
       conn_id_vec[0] = conn_id;
