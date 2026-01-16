@@ -6,6 +6,11 @@
 #include <deque>
 #include <thread>
 #include <signal.h>
+#include <sstream>
+#include <vector>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 using namespace uccl;
 
@@ -27,6 +32,37 @@ DEFINE_string(
     test, "basic",
     "Which test to run: basic, async, pingpong, mt (multi-thread), "
     "mc (multi-connection), mq (multi-queue), bimq (bi-directional mq), tput.");
+
+// Helper function to exchange listen ports over bootstrap connection (test-only)
+static std::vector<uint16_t> exchange_listen_ports_test(
+    int bootstrap_fd, const std::vector<uint16_t>& local_ports) {
+  // Send the number of listen ports we have
+  uint32_t num_local_ports = local_ports.size();
+  ssize_t ret = send(bootstrap_fd, &num_local_ports, sizeof(uint32_t), 0);
+  CHECK(ret == sizeof(uint32_t)) << "Failed to send num_local_ports";
+
+  // Receive the number of remote listen ports
+  uint32_t num_remote_ports = 0;
+  ret = recv(bootstrap_fd, &num_remote_ports, sizeof(uint32_t), MSG_WAITALL);
+  CHECK(ret == sizeof(uint32_t)) << "Failed to receive num_remote_ports";
+
+  // Send our listen ports
+  ret = send(bootstrap_fd, local_ports.data(),
+             num_local_ports * sizeof(uint16_t), 0);
+  CHECK(ret == (ssize_t)(num_local_ports * sizeof(uint16_t)))
+      << "Failed to send listen ports";
+
+  // Receive remote listen ports
+  std::vector<uint16_t> remote_ports(num_remote_ports);
+  ret = recv(bootstrap_fd, remote_ports.data(),
+             num_remote_ports * sizeof(uint16_t), MSG_WAITALL);
+  CHECK(ret == (ssize_t)(num_remote_ports * sizeof(uint16_t)))
+      << "Failed to receive remote listen ports";
+
+  LOG(INFO) << "[Test] exchanged listen ports: local=" << num_local_ports
+            << ", remote=" << num_remote_ports;
+  return remote_ports;
+}
 
 enum TestType { kBasic, kAsync, kPingpong, kMt, kMc, kMq, kBiMq, kTput };
 
@@ -92,22 +128,27 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < kMaxArraySize; i++) ep.uccl_listen();
 
     conn_id = ep.uccl_connect(0, 0, FLAGS_serverip, ep.listen_port_vec_[0]);
+    
+    // Exchange listen ports with the server so we can connect to the correct ports
+    std::vector<uint16_t> remote_listen_ports = 
+        exchange_listen_ports_test(conn_id.boostrap_id, ep.listen_port_vec_);
+    
     if (test_type == kMc) {
       conn_id_vec[0] = conn_id;
       for (int i = 1; i < kNumConns; i++)
         conn_id_vec[i] =
-            ep.uccl_connect(0, 0, FLAGS_serverip, ep.listen_port_vec_[0]);
+            ep.uccl_connect(0, 0, FLAGS_serverip, remote_listen_ports[0]);
     } else if (test_type == kMq) {
       conn_id_vec[0] = conn_id;
       for (int i = 1; i < kNumVdevices; i++)
         conn_id_vec[i] =
-            ep.uccl_connect(i, i, FLAGS_serverip, ep.listen_port_vec_[i]);
+            ep.uccl_connect(i, i, FLAGS_serverip, remote_listen_ports[i]);
     } else if (test_type == kBiMq) {
       conn_id_vec[0] = conn_id;
       for (int i = 1; i < kNumVdevices; i++) {
         if (i % 2 == 0)
           conn_id_vec[i] =
-              ep.uccl_connect(i, i, FLAGS_serverip, ep.listen_port_vec_[i]);
+              ep.uccl_connect(i, i, FLAGS_serverip, remote_listen_ports[i]);
         else
           conn_id_vec[i] = ep.uccl_accept(i, &remote_vdevs[i], remote_ip[i],
                                           ep.listen_fd_vec_[i]);
@@ -373,6 +414,11 @@ int main(int argc, char* argv[]) {
 
     conn_id =
         ep.uccl_accept(0, &remote_vdevs[0], remote_ip[0], ep.listen_fd_vec_[0]);
+    
+    // Exchange listen ports with the client so they can connect to the correct ports
+    std::vector<uint16_t> remote_listen_ports = 
+        exchange_listen_ports_test(conn_id.boostrap_id, ep.listen_port_vec_);
+    
     if (test_type == kMc) {
       conn_id_vec[0] = conn_id;
       for (int i = 1; i < kNumConns; i++) {
@@ -393,7 +439,7 @@ int main(int argc, char* argv[]) {
                                           ep.listen_fd_vec_[i]);
         else
           conn_id_vec[i] =
-              ep.uccl_connect(i, i, FLAGS_clientip, ep.listen_port_vec_[i]);
+              ep.uccl_connect(i, i, FLAGS_clientip, remote_listen_ports[i]);
       }
     }
 
