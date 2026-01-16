@@ -1771,9 +1771,16 @@ Endpoint::Endpoint(int gpu)
     create_engine_and_add_to_engine_future(i, gpu_, engine_futures);
   }
   std::vector<UcclEngine*> engines;
+  int engine_idx = 0;
   for (auto& engine_future : engine_futures) {
     engine_vec_.emplace_back(std::move(engine_future.get()));
     engines.push_back(engine_vec_.back().get());
+    // Populate engine_id_to_engine_map_ so install_flow_on_engine() can find engines
+    {
+      std::lock_guard<std::mutex> lock(engine_map_mutex_);
+      engine_id_to_engine_map_[engine_idx] = engine_vec_.back().get();
+    }
+    engine_idx++;
   }
 
   ctx_pool_ = new SharedPool<PollCtx*, true>(

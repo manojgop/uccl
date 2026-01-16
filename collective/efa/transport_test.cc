@@ -88,8 +88,7 @@ int main(int argc, char* argv[]) {
   pin_thread_to_cpu(0);
 
   if (is_client) {
-    auto ep = Endpoint();
-    ep.initialize_engine_by_gpu_idx(0);
+    auto ep = Endpoint(0);
     DCHECK(FLAGS_serverip != "");
     int const kMaxArraySize = std::max(kNumConns, kNumVdevices);
     ConnID conn_id, conn_id2;
@@ -380,8 +379,7 @@ int main(int argc, char* argv[]) {
       }
     }
   } else {
-    auto ep = Endpoint();
-    ep.initialize_engine_by_gpu_idx(0);
+    auto ep = Endpoint(0);
     int const kMaxArraySize = std::max(kNumConns, kNumVdevices);
     ConnID conn_id, conn_id2;
     ConnID conn_id_vec[kMaxArraySize];
