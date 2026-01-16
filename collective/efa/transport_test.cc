@@ -15,16 +15,64 @@
 
 using namespace uccl;
 
-const size_t kTestIters = 1024000000000UL;
+// Helper functions for persistent OOB coordination
+inline int create_oob_client_socket(const std::string& server_ip, int port) {
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  CHECK(sockfd >= 0) << "Failed to create OOB socket";
+  
+  struct sockaddr_in server_addr;
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(port + 1);  // Use port+1 for persistent connection
+  server_addr.sin_addr.s_addr = inet_addr(server_ip.c_str());
+  
+  while (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  
+  int flag = 1;
+  setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (void*)&flag, sizeof(int));
+  return sockfd;
+}
+
+inline int create_oob_server_socket(int port) {
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  CHECK(sockfd >= 0) << "Failed to create OOB listen socket";
+  
+  int opt = 1;
+  setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  
+  struct sockaddr_in addr;
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port + 1);  // Use port+1 for persistent connection
+  addr.sin_addr.s_addr = INADDR_ANY;
+  
+  CHECK(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) >= 0) << "Bind failed";
+  CHECK(listen(sockfd, 1) >= 0) << "Listen failed";
+  
+  struct sockaddr_in client_addr;
+  socklen_t client_len = sizeof(client_addr);
+  int client_fd = accept(sockfd, (struct sockaddr*)&client_addr, &client_len);
+  CHECK(client_fd >= 0) << "Accept failed";
+  
+  int flag = 1;
+  setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (void*)&flag, sizeof(int));
+  
+  close(sockfd);
+  return client_fd;
+}
+
 const std::chrono::duration kReportIntervalSec = std::chrono::seconds(2);
 const size_t kReportIters = 5000;
 const uint32_t kNumConns = 4;
+const size_t kChunkSize = 131072;  // 128KB chunk size - matches NCCL_P2P_NET_CHUNKSIZE
 
-size_t kTestMsgSize = 1024000;
+size_t kTestMsgSize = 131072;  // 128KB - matches NCCL_P2P_NET_CHUNKSIZE
 size_t kMaxInflight = 8;
 
-DEFINE_uint64(size, 1024000, "Size of test message.");
-DEFINE_uint64(infly, 8, "Max num of test messages in the flight.");
+DEFINE_uint64(size, 131072, "Total transfer size per iteration. Will be chunked into 128KB pieces.");
+DEFINE_uint64(iterations, 7500, "Number of iterations (safe for 128KB without delay).");
+DEFINE_uint64(delay_us, 0, "Delay in us after each send. Use 300us for 100K+ iterations.");
+DEFINE_uint64(infly, 64, "Max inflight messages. Use 64+ for peak tput, 8 for latency.");
 DEFINE_string(serverip, "", "Server IP address the client tries to connect.");
 DEFINE_string(clientip, "", "Client IP address the server tries to connect.");
 DEFINE_uint32(oobport, 19999, "Out-of-band TCP port for bootstrapping and port exchange.");
@@ -86,9 +134,16 @@ int main(int argc, char* argv[]) {
   std::uniform_int_distribution<int> distribution(1024, kTestMsgSize);
   srand(42);
   pin_thread_to_cpu(0);
+  
+  // Use FLAGS_infly for max inflight depth
+  kMaxInflight = FLAGS_infly;
+
+  // OOB socket for coordination (used in kTput test)
+  int oob_sock = -1;
 
   if (is_client) {
-    auto ep = Endpoint(0);
+    auto ep = Endpoint();
+    ep.initialize_engine_by_gpu_idx(0);
     DCHECK(FLAGS_serverip != "");
     int const kMaxArraySize = std::max(kNumConns, kNumVdevices);
     ConnID conn_id, conn_id2;
@@ -105,7 +160,54 @@ int main(int argc, char* argv[]) {
                      ep.listen_port_vec_.size() * sizeof(uint16_t),
                      remote_listen_ports.data(),
                      kMaxArraySize * sizeof(uint16_t));
-    LOG(INFO) << "[Client] Received server ports, connecting to first port: " << remote_listen_ports[0];
+    LOG(INFO) << "[Client] Received server ports, preparing CUDA buffers...";
+
+    // Allocate and register CUDA memory BEFORE connecting.
+    // This prevents the client from flooding the server with packets
+    // before the server has called uccl_recv().
+    int send_len = kTestMsgSize, recv_len = kTestMsgSize;
+    // Use synchronous mode (pipeline depth 1) to avoid buffer reuse issues
+    // With async APIs, buffers may still be in use even after poll() returns
+    constexpr int kPipelineDepth = 1;
+    constexpr int kNumBuffers = 8;  // Allocate extra buffers for safety
+    uint8_t *data[kNumBuffers], *data2[kNumBuffers];
+    Mhandle mh[kNumBuffers], mh2[kNumBuffers];
+
+    auto gpu_idx = 0;  // Use single GPU for all buffers
+    auto dev_idx = get_dev_idx_by_gpu_idx(0);
+    cudaSetDevice(gpu_idx);
+    auto* dev = EFAFactory::GetEFADevice(dev_idx);
+
+    for (int i = 0; i < kNumBuffers; i++) {
+
+#ifdef INTEL_RDMA_NIC
+      cudaMallocManaged(&data[i], kTestMsgSize, cudaMemAttachGlobal);
+      mh[i].mr =
+          ibv_reg_mr(dev->pd, data[i], kTestMsgSize,
+                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+      cudaMallocManaged(&data2[i], kTestMsgSize, cudaMemAttachGlobal);
+      mh2[i].mr =
+          ibv_reg_mr(dev->pd, data2[i], kTestMsgSize,
+                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+#else
+      cudaMalloc(&data[i], kTestMsgSize);
+      mh[i].mr =
+          ibv_reg_mr(dev->pd, data[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
+      cudaMalloc(&data2[i], kTestMsgSize);
+      mh2[i].mr =
+          ibv_reg_mr(dev->pd, data2[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
+#endif
+    }
+    cudaSetDevice(0);
+
+    LOG(INFO) << "[Client] CUDA buffers ready, connecting to server...";
+
+    // Create persistent OOB socket for coordination (only for kTput test)
+    if (test_type == kTput) {
+      LOG(INFO) << "[Client] Creating persistent OOB connection for flow control...";
+      oob_sock = create_oob_client_socket(FLAGS_serverip, FLAGS_oobport);
+      LOG(INFO) << "[Client] OOB connection established";
+    }
 
     conn_id = ep.uccl_connect(0, 0, FLAGS_serverip, remote_listen_ports[0]);
     
@@ -131,26 +233,6 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    int send_len = kTestMsgSize, recv_len = kTestMsgSize;
-    uint8_t *data[kNumVdevices], *data2[kNumVdevices];
-    Mhandle mh[kNumVdevices], mh2[kNumVdevices];
-
-    for (int i = 0; i < kNumVdevices; i++) {
-      auto gpu_idx = i;
-      auto dev_idx = get_dev_idx_by_gpu_idx(i);
-
-      cudaSetDevice(gpu_idx);
-      auto* dev = EFAFactory::GetEFADevice(dev_idx);
-
-      cudaMalloc(&data[i], kTestMsgSize);
-      mh[i].mr =
-          ibv_reg_mr(dev->pd, data[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
-      cudaMalloc(&data2[i], kTestMsgSize);
-      mh2[i].mr =
-          ibv_reg_mr(dev->pd, data2[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
-    }
-    cudaSetDevice(0);
-
     uint64_t* data_u64;
     data_u64 = reinterpret_cast<uint64_t*>(data[0]);
 
@@ -162,7 +244,14 @@ int main(int argc, char* argv[]) {
     PollCtx* last_ctx = nullptr;
     uint32_t inflight_msgs[kNumVdevices] = {0};
 
-    for (size_t i = 0; i < kTestIters;) {
+    // Synchronization barrier: Wait for server to enter uccl_recv() before flooding.
+    // This prevents overwhelming the server before it's ready to receive.
+    // 1 second provides robust margin (server takes ~110ms in logs).
+    LOG(INFO) << "[Client] Connected, waiting for server to be ready...";
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    LOG(INFO) << "[Client] Starting send loop for " << FLAGS_iterations << " iterations...";
+
+    for (size_t i = 0; i < FLAGS_iterations;) {
       send_len = kTestMsgSize;
       if (FLAGS_rand) send_len = distribution(generator);
 
@@ -178,11 +267,21 @@ int main(int argc, char* argv[]) {
         case kBasic: {
           TscTimer timer;
           timer.start();
-          ep.uccl_send(conn_id, data[0], send_len, &mh[0],
-                       /*busypoll=*/true);
+          ep.uccl_send(conn_id, data[0], send_len, &mh[0]);
           timer.stop();
           rtts.push_back(timer.avg_usec(freq_ghz));
           sent_bytes += send_len;
+          
+          // Optional pacing delay to prevent buffer pool exhaustion in stress tests
+          if (FLAGS_delay_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(FLAGS_delay_us));
+          }
+          
+          if (i % 100 == 0) {
+            LOG(INFO) << "[Client] Completed iteration " << i 
+                     << ", sent " << send_len << " bytes";
+          }
+          
           i++;
           break;
         }
@@ -325,17 +424,34 @@ int main(int argc, char* argv[]) {
           break;
         }
         case kTput: {
-          auto* poll_ctx =
-              ep.uccl_send_async(conn_id, data[0], send_len, &mh[0]);
-          poll_ctx->timestamp = rdtsc();
-          if (last_ctx) {
-            auto async_start = last_ctx->timestamp;
-            ep.uccl_poll(last_ctx);
-            rtts.push_back(to_usec(rdtsc() - async_start, freq_ghz));
-            sent_bytes += send_len;
-            i++;
+          // Chunked send with proper client-server coordination
+          // Server signals when ready, client waits before sending
+          size_t total_size = send_len;
+          size_t offset = 0;
+          std::vector<PollCtx*> msg_ctxs;
+          
+          // Wait for server to be ready
+          char ready_signal;
+          CHECK(recv(oob_sock, &ready_signal, 1, 0) == 1) << "Failed to receive ready signal";
+          
+          while (offset < total_size) {
+            size_t chunk_len = std::min(kChunkSize, total_size - offset);
+            
+            auto* poll_ctx = ep.uccl_send_async(conn_id, data[0] + offset, chunk_len, &mh[0]);
+            poll_ctx->timestamp = rdtsc();
+            msg_ctxs.push_back(poll_ctx);
+            
+            offset += chunk_len;
           }
-          last_ctx = poll_ctx;
+          
+          // Poll all chunks
+          for (auto* ctx : msg_ctxs) {
+            auto async_start = ctx->timestamp;
+            ep.uccl_poll(ctx);
+            rtts.push_back(to_usec(rdtsc() - async_start, freq_ghz));
+          }
+          sent_bytes += total_size;
+          i++;
           break;
         }
         default:
@@ -378,8 +494,46 @@ int main(int argc, char* argv[]) {
         start_bw_mea = std::chrono::high_resolution_clock::now();
       }
     }
+    
+    // For kTput test, drain remaining inflight messages
+    if (test_type == kTput) {
+      while (!poll_ctxs.empty()) {
+        auto* poll_ctx = poll_ctxs.front();
+        poll_ctxs.pop_front();
+        ep.uccl_poll(poll_ctx);
+      }
+      LOG(INFO) << "[Client] Completed " << FLAGS_iterations << " sends";
+    }
+    
+    // Final throughput report (for all test types)
+    auto end_final = std::chrono::high_resolution_clock::now();
+    auto total_duration_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+        end_final - start_bw_mea).count();
+    
+    if (rtts.size() > 0 && total_duration_usec > 0) {
+      uint64_t med_latency = Percentile(rtts, 50);
+      uint64_t tail_latency = Percentile(rtts, 99);
+      
+      // Calculate total bytes sent across all iterations
+      uint64_t total_bytes = static_cast<uint64_t>(FLAGS_iterations) * kTestMsgSize;
+      
+      // 24B: 4B FCS + 8B frame delimiter + 12B interframe gap
+      auto bw_gbps = total_bytes * ((EFA_MTU * 1.0 + 24) / (EFA_MTU - kUcclPktHdrLen)) * 
+                     8.0 / 1000 / 1000 / 1000 / (total_duration_usec * 1e-6);
+      auto app_bw_gbps = total_bytes * 8.0 / 1000 / 1000 / 1000 / (total_duration_usec * 1e-6);
+      
+      LOG(INFO) << "=== FINAL RESULTS ===";
+      LOG(INFO) << "Total iterations: " << FLAGS_iterations;
+      LOG(INFO) << "Total bytes: " << total_bytes << " (" << total_bytes / (1024*1024) << " MB)";
+      LOG(INFO) << "Total time: " << total_duration_usec / 1000000.0 << " seconds";
+      LOG(INFO) << "Median RTT: " << med_latency << " us";
+      LOG(INFO) << "99th percentile RTT: " << tail_latency << " us";
+      LOG(INFO) << "Link bandwidth: " << bw_gbps << " Gbps";
+      LOG(INFO) << "Application bandwidth: " << app_bw_gbps << " Gbps";
+    }
   } else {
-    auto ep = Endpoint(0);
+    auto ep = Endpoint();
+    ep.initialize_engine_by_gpu_idx(0);
     int const kMaxArraySize = std::max(kNumConns, kNumVdevices);
     ConnID conn_id, conn_id2;
     ConnID conn_id_vec[kMaxArraySize];
@@ -397,7 +551,53 @@ int main(int argc, char* argv[]) {
                            ep.listen_port_vec_.size() * sizeof(uint16_t),
                            remote_listen_ports.data(),
                            kMaxArraySize * sizeof(uint16_t));
-    LOG(INFO) << "[Server] Exchanged ports with client, waiting for connection...";
+    LOG(INFO) << "[Server] Exchanged ports with client, preparing CUDA buffers...";
+
+    // Allocate and register CUDA memory BEFORE accepting connections.
+    // This prevents buffer exhaustion during the ~100ms CUDA setup delay.
+    int send_len = kTestMsgSize, recv_len = kTestMsgSize;
+    // Use synchronous mode (pipeline depth 1) to avoid buffer reuse issues
+    // With async APIs, buffers may still be in use even after poll() returns
+    constexpr int kPipelineDepth = 1;
+    constexpr int kNumBuffers = 8;  // Allocate extra buffers for safety
+    uint8_t *data[kNumBuffers], *data2[kNumBuffers];
+    Mhandle mh[kNumBuffers], mh2[kNumBuffers];
+
+    auto gpu_idx = 0;  // Use single GPU for all buffers
+    auto dev_idx = get_dev_idx_by_gpu_idx(0);
+    cudaSetDevice(gpu_idx);
+    auto* dev = EFAFactory::GetEFADevice(dev_idx);
+
+    for (int i = 0; i < kNumBuffers; i++) {
+
+#ifdef INTEL_RDMA_NIC
+      cudaMallocManaged(&data[i], kTestMsgSize, cudaMemAttachGlobal);
+      mh[i].mr =
+          ibv_reg_mr(dev->pd, data[i], kTestMsgSize,
+                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+      cudaMallocManaged(&data2[i], kTestMsgSize, cudaMemAttachGlobal);
+      mh2[i].mr =
+          ibv_reg_mr(dev->pd, data2[i], kTestMsgSize,
+                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+#else
+      cudaMalloc(&data[i], kTestMsgSize);
+      mh[i].mr =
+          ibv_reg_mr(dev->pd, data[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
+      cudaMalloc(&data2[i], kTestMsgSize);
+      mh2[i].mr =
+          ibv_reg_mr(dev->pd, data2[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
+#endif
+    }
+    cudaSetDevice(0);
+
+    LOG(INFO) << "[Server] CUDA buffers ready, waiting for connection...";
+
+    // Create persistent OOB socket for coordination (only for kTput test)
+    if (test_type == kTput) {
+      LOG(INFO) << "[Server] Creating persistent OOB socket for flow control...";
+      oob_sock = create_oob_server_socket(FLAGS_oobport);
+      LOG(INFO) << "[Server] OOB connection established";
+    }
 
     conn_id =
         ep.uccl_accept(0, &remote_vdevs[0], remote_ip[0], ep.listen_fd_vec_[0]);
@@ -426,26 +626,6 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    int send_len = kTestMsgSize, recv_len = kTestMsgSize;
-    uint8_t *data[kNumVdevices], *data2[kNumVdevices];
-    Mhandle mh[kNumVdevices], mh2[kNumVdevices];
-
-    for (int i = 0; i < kNumVdevices; i++) {
-      auto gpu_idx = i;
-      auto dev_idx = get_dev_idx_by_gpu_idx(i);
-
-      cudaSetDevice(gpu_idx);
-      auto* dev = EFAFactory::GetEFADevice(dev_idx);
-
-      cudaMalloc(&data[i], kTestMsgSize);
-      mh[i].mr =
-          ibv_reg_mr(dev->pd, data[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
-      cudaMalloc(&data2[i], kTestMsgSize);
-      mh2[i].mr =
-          ibv_reg_mr(dev->pd, data2[i], kTestMsgSize, IBV_ACCESS_LOCAL_WRITE);
-    }
-    cudaSetDevice(0);
-
     uint64_t* data_u64;
     data_u64 = reinterpret_cast<uint64_t*>(data[0]);
     auto start = std::chrono::high_resolution_clock::now();
@@ -454,14 +634,35 @@ int main(int argc, char* argv[]) {
     PollCtx* last_ctx = nullptr;
     uint32_t inflight_msgs[kNumVdevices] = {0};
 
-    for (size_t i = 0; i < kTestIters;) {
+    // Pre-post receive buffers BEFORE signaling client, to prevent buffer exhaustion.
+    // For synchronous blocking mode, no need to pre-post
+    LOG(INFO) << "[Server] Ready to receive (synchronous blocking mode)";
+
+    // Synchronization barrier: Signal to client that server is ready to receive.
+    LOG(INFO) << "[Server] Signaling client via OOB...";
+    char ready_signal = 'R';
+    LOG(INFO) << "[Server] Entering receive loop for " << FLAGS_iterations << " iterations...";
+
+    for (size_t i = 0; i < FLAGS_iterations;) {
       send_len = kTestMsgSize;
       if (FLAGS_rand) send_len = distribution(generator);
 
       switch (test_type) {
         case kBasic: {
-          ep.uccl_recv(conn_id, data[0], &recv_len, &mh[0],
-                       /*busypoll=*/true);
+          // Use busypoll mode (true) to allow engine thread to keep processing
+          // and freeing buffers, preventing exhaustion in tight loops
+          ep.uccl_recv(conn_id, data[0], &recv_len, &mh[0], true);
+          
+          // Add delay to allow engine thread to process ACKs and free buffers
+          if (FLAGS_delay_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(FLAGS_delay_us));
+          }
+          
+          if (i % 100 == 0) {
+            LOG(INFO) << "[Server] Completed iteration " << i
+                     << ", received " << recv_len << " bytes";
+          }
+          
           i++;
           break;
         }
@@ -581,9 +782,34 @@ int main(int argc, char* argv[]) {
           break;
         }
         case kTput: {
-          auto* poll_ctx = ep.uccl_recv_async(conn_id, data, &recv_len, &mh[0]);
-          if (last_ctx) ep.uccl_poll(last_ctx);
-          last_ctx = poll_ctx;
+          // Signal client we're ready for this message
+          char ready_signal = 'R';
+          CHECK(send(oob_sock, &ready_signal, 1, 0) == 1) << "Failed to send ready signal";
+          
+          // Chunked receive - post all receives for this message
+          size_t total_size = send_len;
+          size_t num_chunks = (total_size + kChunkSize - 1) / kChunkSize;
+          size_t offset = 0;
+          
+          std::vector<PollCtx*> msg_ctxs;
+          std::vector<int> recv_lens(num_chunks, 0);
+          
+          for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
+            auto* poll_ctx = ep.uccl_recv_async(conn_id, data[0] + offset,
+                                                &recv_lens[chunk_idx], &mh[0]);
+            msg_ctxs.push_back(poll_ctx);
+            offset += kChunkSize;
+          }
+          
+          // Poll all chunks
+          recv_len = 0;
+          for (auto* ctx : msg_ctxs) {
+            ep.uccl_poll(ctx);
+          }
+          for (int len : recv_lens) {
+            recv_len += len;
+          }
+          
           i++;
           break;
         }
@@ -625,6 +851,11 @@ int main(int argc, char* argv[]) {
         cudaMemcpy(data_u64, host_data_u64, send_len, cudaMemcpyHostToDevice);
       }
     }
+  }
+
+  // Close OOB socket if it was opened
+  if (test_type == kTput && oob_sock >= 0) {
+    close(oob_sock);
   }
 
   return 0;

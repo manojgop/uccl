@@ -692,13 +692,39 @@ void EFASocket::post_recv_wrs(uint32_t budget, uint16_t qp_idx) {
   auto* qp = qp_list_[qp_idx];
 
   auto* wr_head = &recv_wr_vec_[0];
+  int posted_cnt = 0;
+  // Always post at least kMinRecvWr (8) to ensure forward progress, even when buffers low.
+  // Receiving packets is the ONLY way to free buffers in synchronous uccl_recv() pattern.
+  constexpr int kMinRecvWr = 8;
   for (int i = 0; i < deficit_cnt; i++) {
+    // Reserve 50% of buffers (131,072) to prevent complete exhaustion.
+    // With 26 QPs × 256 WRs = 6,656 WRs × 3 buffers = ~20K buffers just for WRs,
+    // plus packets being processed, we need significant headroom.
+    // Check ALL three pools since pkt_hdr and frame_desc are shared with control QPs.
+    // BUT: Allow posting at least kMinRecvWr to ensure forward progress.
+    if (posted_cnt >= kMinRecvWr &&
+        (pkt_hdr_pool_->avail_slots() < NUM_FRAMES / 2 ||
+         pkt_data_pool_->avail_slots() < NUM_FRAMES / 2 ||
+         frame_desc_pool_->avail_slots() < NUM_FRAMES / 2)) {
+      LOG_EVERY_N(WARNING, 1000) << "Approaching buffer limit, limiting WR posting to " << posted_cnt
+                                 << " pkt_hdr: " << pkt_hdr_pool_->avail_slots() << " "
+                                 << "pkt_data: " << pkt_data_pool_->avail_slots() << " "
+                                 << "frame_desc: " << frame_desc_pool_->avail_slots();
+      break;
+    }
+    
     ret = pkt_hdr_pool_->alloc_buff(&pkt_hdr_buf);
     ret |= pkt_data_pool_->alloc_buff(&pkt_data_buf);
     ret |= frame_desc_pool_->alloc_buff(&frame_desc_buf);
-    DCHECK(ret == 0) << pkt_hdr_pool_->avail_slots() << " "
-                     << pkt_data_pool_->avail_slots() << " "
-                     << frame_desc_pool_->avail_slots();
+    if (ret != 0) {
+      // Buffer pools exhausted. Stop posting receive WRs and keep the deficit.
+      // The deficit will be processed later when buffers become available.
+      LOG_EVERY_N(WARNING, 1000) << "Buffer pools exhausted, skipping recv WR posting. "
+                                 << "pkt_hdr: " << pkt_hdr_pool_->avail_slots() << " "
+                                 << "pkt_data: " << pkt_data_pool_->avail_slots() << " "
+                                 << "frame_desc: " << frame_desc_pool_->avail_slots();
+      break;
+    }
 
     auto* frame_desc = FrameDesc::Create(
         frame_desc_buf, pkt_hdr_buf, EFA_UD_ADDITION + kUcclPktHdrLen,
@@ -729,13 +755,14 @@ void EFASocket::post_recv_wrs(uint32_t budget, uint16_t qp_idx) {
         perror("Failed to post recv");
         exit(1);
       }
+      posted_cnt = i + 1;
       if (i + 1 != deficit_cnt)
         wr_head = &recv_wr_vec_[(i + 1) % kMaxChainedWr];
     }
   }
 
-  recv_queue_wrs_ += deficit_cnt;
-  deficit_cnt = 0;
+  recv_queue_wrs_ += posted_cnt;
+  deficit_cnt -= posted_cnt;
 }
 
 void EFASocket::post_recv_wrs_for_ctrl(uint32_t budget, uint16_t qp_idx) {
@@ -749,10 +776,32 @@ void EFASocket::post_recv_wrs_for_ctrl(uint32_t budget, uint16_t qp_idx) {
   auto* qp = ctrl_qp_list_[qp_idx];
 
   auto* wr_head = &recv_wr_vec_[0];
+  int posted_cnt = 0;
+  // Always post at least kMinRecvWr (8) for control QPs to ensure ACKs can be received.
+  constexpr int kMinRecvWr = 8;
   for (int i = 0; i < deficit_cnt; i++) {
+    // Reserve 50% of shared buffers for critical control traffic.
+    // Control QPs need headroom for ACKs which are critical for flow control.
+    // BUT: Allow posting at least kMinRecvWr to ensure ACKs can be received.
+    if (posted_cnt >= kMinRecvWr &&
+        (pkt_hdr_pool_->avail_slots() < NUM_FRAMES / 2 ||
+         frame_desc_pool_->avail_slots() < NUM_FRAMES / 2)) {
+      LOG_EVERY_N(WARNING, 1000) << "Approaching ctrl buffer limit, limiting WR posting to " << posted_cnt
+                                 << " pkt_hdr: " << pkt_hdr_pool_->avail_slots() << " "
+                                 << "frame_desc: " << frame_desc_pool_->avail_slots();
+      break;
+    }
+    
     ret = pkt_hdr_pool_->alloc_buff(&pkt_hdr_buf);
     ret |= frame_desc_pool_->alloc_buff(&frame_desc_buf);
-    DCHECK(ret == 0);
+    if (ret != 0) {
+      // Buffer pools exhausted. Stop posting receive WRs and keep the deficit.
+      // The deficit will be processed later when buffers become available.
+      LOG_EVERY_N(WARNING, 1000) << "Ctrl buffer pools exhausted, skipping recv WR posting. "
+                                 << "pkt_hdr: " << pkt_hdr_pool_->avail_slots() << " "
+                                 << "frame_desc: " << frame_desc_pool_->avail_slots();
+      break;
+    }
 
     auto* frame_desc = FrameDesc::Create(
         frame_desc_buf, pkt_hdr_buf,
@@ -781,12 +830,13 @@ void EFASocket::post_recv_wrs_for_ctrl(uint32_t budget, uint16_t qp_idx) {
         perror("Failed to post recv");
         exit(1);
       }
+      posted_cnt = i + 1;
       if (i + 1 != deficit_cnt)
         wr_head = &recv_wr_vec_[(i + 1) % kMaxChainedWr];
     }
   }
 
-  deficit_cnt = 0;
+  deficit_cnt -= posted_cnt;
 }
 
 void EFASocket::poll_send_cq() {

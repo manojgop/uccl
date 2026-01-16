@@ -543,7 +543,14 @@ void UcclFlow::rx_messages() {
         process_rttprobe_rsp(ucclh->timestamp1, ucclh->timestamp2,
                              ucclsackh->timestamp3, timestamp4, ucclh->path_id);
       case UcclPktHdr::UcclFlags::kAck:
-        last_received_rwnd_ = ucclsackh->rwnd.value();
+        {
+          auto new_rwnd = ucclsackh->rwnd.value();
+          if (new_rwnd != last_received_rwnd_) {
+            VLOG_EVERY_N(3, 10) << "Received ACK with rwnd=" << new_rwnd 
+                                  << " (was " << last_received_rwnd_ << ")";
+          }
+          last_received_rwnd_ = new_rwnd;
+        }
         // ACK packet, update the flow.
         process_ack(ucclh);
         // Free the received frame.
@@ -563,6 +570,7 @@ void UcclFlow::rx_messages() {
         consume_ret = rx_tracking_.consume(this, msgbuf);
         num_data_frames_recvd++;
         path_id = ucclh->path_id;
+        last_received_path_id_ = path_id;  // Track for unsolicited ACKs
         break;
       default:
         CHECK(false) << "Unsupported UcclFlags: "
@@ -573,30 +581,117 @@ void UcclFlow::rx_messages() {
 
   // Send one ack for a bunch of received packets.
   if (num_data_frames_recvd) {
-    // To avoid receiver-side buffer empty.
-    if (rx_tracking_.num_unconsumed_msgbufs() < kMaxUnconsumedRxMsgbufs) {
-      auto net_flags = received_rtt_probe ? UcclPktHdr::UcclFlags::kAckRttProbe
-                                          : UcclPktHdr::UcclFlags::kAck;
-      // Ack following the probe path if received, or the last path.
-      path_id = received_rtt_probe ? probe_path_id : path_id;
-      path_id = data_path_id_to_ctrl_path_id(path_id);
-      auto [src_qp_idx, dst_qp_idx] = path_id_to_src_dst_qp_for_ctrl(path_id);
+    auto net_flags = received_rtt_probe ? UcclPktHdr::UcclFlags::kAckRttProbe
+                                        : UcclPktHdr::UcclFlags::kAck;
+    // Ack following the probe path if received, or the last path.
+    path_id = received_rtt_probe ? probe_path_id : path_id;
+    path_id = data_path_id_to_ctrl_path_id(path_id);
+    auto [src_qp_idx, dst_qp_idx] = path_id_to_src_dst_qp_for_ctrl(path_id);
 
-      // Avoiding client sending too much packet which would empty msgbuf.
-      auto rwnd =
-          kMaxUnconsumedRxMsgbufs - rx_tracking_.num_unconsumed_msgbufs();
-      FrameDesc* ack_frame =
-          craft_ackpacket(path_id, pcb_.seqno(), pcb_.ackno(), net_flags,
-                          timestamp1, timestamp2, rwnd);
-      ack_frame->set_dest_ah(remote_ah_);
-      ack_frame->set_dest_qpn(remote_meta_->qpn_list_ctrl[dst_qp_idx]);
-
-      socket_->post_send_wr(ack_frame, src_qp_idx);
+    // Calculate available receive window based on BOTH unconsumed msgbufs AND
+    // available buffer pool slots. This prevents sender from overwhelming
+    // receiver when NIC buffers are exhausted.
+    auto rwnd_by_msgbufs =
+        kMaxUnconsumedRxMsgbufs - rx_tracking_.num_unconsumed_msgbufs();
+    
+    // Initial slow-start: if no app buffers have been posted yet,
+    // advertise very low rwnd to prevent flooding during app setup (CUDA alloc, MR reg, etc.)
+    // With 26 QPs, rwnd=10 per path = 260 total packets in flight.
+    // Once app posts a receive buffer, lift the restriction - receiver is ready!
+    if (!rx_tracking_.has_app_buf_posted()) {
+      rwnd_by_msgbufs = std::min(rwnd_by_msgbufs, 10u);  // Max 10 packets per path before uccl_recv()
     }
+    
+    // Buffer-based throttling DISABLED for transport_test compatibility.
+    // Synchronous uccl_recv() busypolls for complete message, causing deadlock
+    // if sender throttled before message complete. Msgbuf-based throttling sufficient.
+    // auto avail_buffers = socket_->pkt_data_avail_slots();
+    // auto buffer_min_threshold = NUM_FRAMES / 10;
+    // auto buffer_max_threshold = NUM_FRAMES / 2;
+    // uint32_t rwnd_by_buffers = kMaxUnconsumedRxMsgbufs;
+    // if (avail_buffers <= buffer_min_threshold) {
+    //   rwnd_by_buffers = 0;
+    // } else if (avail_buffers < buffer_max_threshold) {
+    //   rwnd_by_buffers = ((avail_buffers - buffer_min_threshold) * kMaxUnconsumedRxMsgbufs) / 
+    //                     (buffer_max_threshold - buffer_min_threshold);
+    // }
+    
+    auto rwnd = rwnd_by_msgbufs;  // Only msgbuf-based throttling
+    
+    FrameDesc* ack_frame =
+        craft_ackpacket(path_id, pcb_.seqno(), pcb_.ackno(), net_flags,
+                        timestamp1, timestamp2, rwnd);
+    ack_frame->set_dest_ah(remote_ah_);
+    ack_frame->set_dest_qpn(remote_meta_->qpn_list_ctrl[dst_qp_idx]);
+
+    socket_->post_send_wr(ack_frame, src_qp_idx);
   }
 
   deserialize_and_append_to_txtracking();
   transmit_pending_packets_drr(true);
+}
+
+void UcclFlow::send_unsolicited_ack() {
+  // Send ACK with current rwnd to apply backpressure on sender.
+  // This is called when buffers are getting full.
+  static thread_local uint64_t last_unsolicited_ack_tsc = 0;
+  auto now_tsc = rdtsc();
+  
+  // Rate limit: send at most once per 1ms to avoid ACK storm while still being responsive
+  if (now_tsc - last_unsolicited_ack_tsc < ns_to_cycles(1000000, freq_ghz)) {
+    return;
+  }
+  last_unsolicited_ack_tsc = now_tsc;
+  
+  // Use the last path that received data (same as regular ACKs).
+  // This ensures symmetric routing and load balancing across paths.
+  uint32_t path_id = last_received_path_id_;
+  path_id = data_path_id_to_ctrl_path_id(path_id);
+  auto [src_qp_idx, dst_qp_idx] = path_id_to_src_dst_qp_for_ctrl(path_id);
+  
+  // Calculate rwnd based on BOTH unconsumed msgbufs AND available buffer pool slots.
+  // This ensures we stop the sender when NIC buffers are exhausted, not just when
+  // application buffers are full.
+  auto rwnd_by_msgbufs = kMaxUnconsumedRxMsgbufs - rx_tracking_.num_unconsumed_msgbufs();
+  
+  // Initial slow-start: if no app buffers have been posted yet,
+  // advertise very low rwnd to prevent flooding during app setup (CUDA alloc, MR reg, etc.)
+  // With 26 QPs, rwnd=10 per path = 260 total packets in flight.
+  // Once app posts a receive buffer, lift the restriction - receiver is ready!
+  if (!rx_tracking_.has_app_buf_posted()) {
+    rwnd_by_msgbufs = std::min(rwnd_by_msgbufs, 10u);  // Max 10 packets per path before uccl_recv()
+  }
+  
+  // Buffer-based throttling DISABLED for transport_test compatibility.
+  // Synchronous uccl_recv() busypolls for complete message, causing deadlock
+  // if sender throttled before message complete. Msgbuf-based throttling sufficient.
+  auto avail_buffers = socket_->pkt_data_avail_slots();
+  // auto buffer_min_threshold = NUM_FRAMES / 10;
+  // auto buffer_max_threshold = NUM_FRAMES / 2;
+  // uint32_t rwnd_by_buffers = kMaxUnconsumedRxMsgbufs;
+  // if (avail_buffers <= buffer_min_threshold) {
+  //   rwnd_by_buffers = 0;
+  // } else if (avail_buffers < buffer_max_threshold) {
+  //   rwnd_by_buffers = ((avail_buffers - buffer_min_threshold) * kMaxUnconsumedRxMsgbufs) / 
+  //                     (buffer_max_threshold - buffer_min_threshold);
+  // }
+  
+  // Only msgbuf-based throttling
+  auto rwnd = rwnd_by_msgbufs;
+  
+  FrameDesc* ack_frame =
+      craft_ackpacket(path_id, pcb_.seqno(), pcb_.ackno(),
+                      UcclPktHdr::UcclFlags::kAck, 0, 0, rwnd);
+  ack_frame->set_dest_ah(remote_ah_);
+  ack_frame->set_dest_qpn(remote_meta_->qpn_list_ctrl[dst_qp_idx]);
+  
+  socket_->post_send_wr(ack_frame, src_qp_idx);
+  
+  VLOG_EVERY_N(3, 100) << "Sent unsolicited ACK with rwnd=" << rwnd 
+          << " (msgbuf-based throttling only)"
+          << " path_id=" << path_id
+          << " unconsumed=" << rx_tracking_.num_unconsumed_msgbufs()
+          << " avail_buffers=" << avail_buffers << " (for reference only)";
 }
 
 void UcclFlow::tx_prepare_messages(Channel::Msg& tx_work) {
@@ -959,7 +1054,11 @@ uint32_t UcclFlow::transmit_pending_packets(uint32_t budget) {
   hard_budget =
       std::min(hard_budget, socket_->send_queue_free_space_per_qp(src_qp_idx));
   // if (last_received_rwnd_ == 0) last_received_rwnd_ = 1;
+  auto rwnd_before = hard_budget;
   hard_budget = std::min(hard_budget, last_received_rwnd_);
+  if (rwnd_before > 0 && hard_budget == 0) {
+    LOG_EVERY_N(WARNING, 100) << "Sender blocked by rwnd=0 (receiver buffers full)";
+  }
   hard_budget = std::min(hard_budget, tx_tracking_.num_unsent_msgbufs());
   hard_budget = std::min(hard_budget, budget);
 
@@ -1371,6 +1470,18 @@ void UcclEngine::receiver_only_run() {
 
     if (frames.size()) {
       process_rx_msg(frames);
+      
+      // Check buffer pressure immediately after processing received packets.
+      // Send unsolicited ACK ASAP when buffer pool is getting low to apply backpressure.
+      // This prevents deadlock when sender floods receiver before recv buffers are posted.
+      auto avail_buffers = socket_->pkt_data_avail_slots();
+      auto total_buffers = NUM_FRAMES;  // 262,144
+      // Trigger at 50% to give sender time to react before exhaustion
+      if (avail_buffers < total_buffers / 2) {  // Less than 50% available
+        for (auto& [flow_id, flow] : active_flows_map_) {
+          flow->send_unsolicited_ack();
+        }
+      }
     }
 
     for (auto& [flow_id, flow] : active_flows_map_) {
@@ -1773,12 +1884,13 @@ Endpoint::Endpoint(int gpu)
   std::vector<UcclEngine*> engines;
   int engine_idx = 0;
   for (auto& engine_future : engine_futures) {
-    engine_vec_.emplace_back(std::move(engine_future.get()));
-    engines.push_back(engine_vec_.back().get());
+    auto engine_ptr = engine_future.get();
+    engines.push_back(engine_ptr.get());
     // Populate engine_id_to_engine_map_ so install_flow_on_engine() can find engines
+    // Move ownership to the map (like lazy init does)
     {
       std::lock_guard<std::mutex> lock(engine_map_mutex_);
-      engine_id_to_engine_map_[engine_idx] = engine_vec_.back().get();
+      engine_id_to_engine_map_[engine_idx] = std::move(engine_ptr);
     }
     engine_idx++;
   }

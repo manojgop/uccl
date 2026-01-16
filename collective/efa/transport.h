@@ -342,6 +342,12 @@ class RXTracking {
   inline uint32_t num_unconsumed_msgbufs() const {
     return num_unconsumed_msgbufs_;
   }
+  inline bool has_app_buf_posted() const {
+    return !app_buf_queue_.empty() || receiver_ready_;
+  }
+  inline void mark_receiver_ready() {
+    receiver_ready_ = true;
+  }
 
  private:
   static void copy_thread_func(uint32_t engine_idx, UcclEngine* engine);
@@ -367,6 +373,7 @@ class RXTracking {
   FrameDesc* deser_msgs_tail_ = nullptr;
   size_t deser_msg_len_ = 0;
   int iov_n_ = 0;
+  bool receiver_ready_ = false;  // Set immediately when uccl_recv is called
 
   friend class Endpoint;
 };
@@ -471,8 +478,17 @@ class UcclFlow {
   void rx_messages();
 
   inline void rx_supply_app_buf(Channel::Msg& rx_work) {
+    // Mark receiver as ready when first app buffer is posted.
+    // This lifts the slow-start rwnd=10 restriction.
+    rx_tracking_.mark_receiver_ready();
     rx_tracking_.try_copy_msgbuf_to_appbuf(&rx_work);
   }
+
+  /**
+   * @brief Send an unsolicited ACK with current rwnd to apply backpressure
+   * when receiver buffers are getting full. Rate-limited to avoid ACK storm.
+   */
+  void send_unsolicited_ack();
 
   /**
    * @brief Push a Message from the application onto the egress queue of
@@ -635,6 +651,7 @@ class UcclFlow {
   eqds::EQDSCC eqds_cc_;
 
   uint32_t last_received_rwnd_ = kMaxUnconsumedRxMsgbufs;
+  uint32_t last_received_path_id_ = 0;  // Track last path for ACKs
 
   // Deficit Round Robin
   int32_t deficit_ = 0;

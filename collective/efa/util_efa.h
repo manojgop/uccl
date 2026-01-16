@@ -433,6 +433,7 @@ class EFASocket {
     pkt_data_pool_->free_buff(pkt_data_addr);
   }
   inline uint32_t get_pkt_data_lkey() { return pkt_data_pool_->get_lkey(); }
+  inline uint32_t pkt_data_avail_slots() { return pkt_data_pool_->avail_slots(); }
 
   inline uint64_t pop_frame_desc() {
     uint64_t pkt_frame_desc;
