@@ -39,7 +39,7 @@ static_assert(
 #endif
 
 #ifdef INTEL_RDMA_NIC
-#define MANAGED
+#define MANAGED            // Use cudaMallocManaged not cudaMalloc
 #endif
 
 #ifdef INTEL_RDMA_NIC
