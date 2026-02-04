@@ -119,6 +119,9 @@ static const uint32_t kMaxChainedWr = 32;
 static const uint32_t kMaxUnconsumedRxMsgbufs = NUM_FRAMES / 16;
 static const uint32_t kMaxMultiRecv = 8;
 
+// Selective signaling: only signal every Nth send to reduce CQ overhead
+static const uint32_t kSendSignalInterval = 16;
+
 // Path configuration.
 // Setting to 20 gives highest bimq perf (191 vs. 186G), but bad for NCCL.
 static const uint32_t kMaxDstQP = 26;  // # of paths/QPs for data per src qp.

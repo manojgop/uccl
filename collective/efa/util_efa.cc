@@ -561,11 +561,24 @@ uint32_t EFASocket::post_send_wr(FrameDesc* frame, uint16_t src_qp_idx) {
   send_wr.wr.ud.ah = dest_ah;
   send_wr.wr.ud.remote_qpn = dest_qpn;
   send_wr.wr.ud.remote_qkey = QKEY;
-  send_wr.send_flags = IBV_SEND_SIGNALED;
+  
+  // Selective signaling: only apply to data packets (not control)
+  bool is_data_qp = (frame->get_pkt_data_len() > 0);
+  bool should_signal = true;  // Always signal control packets
+  if (is_data_qp) {
+    should_signal = ((++send_signal_counter_per_qp_[src_qp_idx] % kSendSignalInterval) == 0);
+  }
+  send_wr.send_flags = should_signal ? IBV_SEND_SIGNALED : 0;
 
   if (ibv_post_send(src_qp, &send_wr, &bad_send_wr)) {
     perror("Server: Failed to post send");
     exit(1);
+  }
+
+  // Track unsignaled sends (only for data QPs) - they'll be accounted for when next signal completes
+  if (is_data_qp && !should_signal) {
+    unsignaled_sends_per_qp_[src_qp_idx]++;
+    unsignaled_sends_total_++;
   }
 
   out_packets_++;
@@ -602,7 +615,20 @@ uint32_t EFASocket::post_send_wrs(std::vector<FrameDesc*>& frames,
     wr->wr.ud.ah = dest_ah;
     wr->wr.ud.remote_qpn = dest_qpn;
     wr->wr.ud.remote_qkey = QKEY;
-    wr->send_flags = IBV_SEND_SIGNALED;
+    // Selective signaling: only signal every kSendSignalInterval sends for UD
+    bool should_signal = ((++send_signal_counter_per_qp_[src_qp_idx] % kSendSignalInterval) == 0);
+    wr->send_flags = should_signal ? IBV_SEND_SIGNALED : 0;
+
+    // Increment counters BEFORE posting to avoid race with completion polling
+    // Must happen before ibv_post_send so that when completions arrive, accounting is complete
+    send_queue_wrs_++;
+    send_queue_wrs_per_qp_[src_qp_idx]++;
+    
+    // Track unsignaled sends - they'll be accounted for when next signal completes
+    if (!should_signal) {
+      unsignaled_sends_per_qp_[src_qp_idx]++;
+      unsignaled_sends_total_++;
+    }
 
     bool is_last = (i + 1) % kMaxChainedWr == 0 || (i + 1) == frames.size();
     wr->next = is_last ? nullptr : &send_wr_vec_[(i + 1) % kMaxChainedWr];
@@ -620,9 +646,7 @@ uint32_t EFASocket::post_send_wrs(std::vector<FrameDesc*>& frames,
         wr_head = &send_wr_vec_[(i + 1) % kMaxChainedWr];
       }
     }
-
-    send_queue_wrs_++;
-    send_queue_wrs_per_qp_[src_qp_idx]++;
+    
     i++;
 
     out_packets_++;
@@ -812,8 +836,13 @@ void EFASocket::poll_send_cq() {
 
     auto* frame = (FrameDesc*)wc_[i].wr_id;
     auto src_qp_idx = frame->get_src_qp_idx();
-    send_queue_wrs_per_qp_[src_qp_idx]--;
-    send_queue_wrs_--;
+    
+    // A signaled completion means this send AND all previous unsignaled sends completed
+    uint32_t unsignaled = unsignaled_sends_per_qp_[src_qp_idx];
+    send_queue_wrs_per_qp_[src_qp_idx] -= (1 + unsignaled);
+    send_queue_wrs_ -= (1 + unsignaled);
+    unsignaled_sends_total_ -= unsignaled;
+    unsignaled_sends_per_qp_[src_qp_idx] = 0;
 
     frame->set_cpe_time_tsc(now);
   }
@@ -840,7 +869,13 @@ std::vector<FrameDesc*> EFASocket::poll_send_cq(uint32_t budget) {
 
       auto* frame = (FrameDesc*)wc_[i].wr_id;
       auto src_qp_idx = frame->get_src_qp_idx();
-      send_queue_wrs_per_qp_[src_qp_idx]--;
+      
+      // A signaled completion means this send AND all previous unsignaled sends completed
+      uint32_t unsignaled = unsignaled_sends_per_qp_[src_qp_idx];
+      send_queue_wrs_per_qp_[src_qp_idx] -= (1 + unsignaled);
+      send_queue_wrs_ -= unsignaled;  // Will subtract 1 more after the loop
+      unsignaled_sends_total_ -= unsignaled;
+      unsignaled_sends_per_qp_[src_qp_idx] = 0;
 
       frame->set_cpe_time_tsc(now);
       frames.push_back(frame);

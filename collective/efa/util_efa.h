@@ -463,6 +463,12 @@ class EFASocket {
   uint32_t recv_queue_wrs_ = 0;
   uint32_t ctrl_send_queue_wrs_ = 0;
 
+  // Selective signaling: track per-QP to ensure correct unsignaled accounting
+  // When a signaled completion arrives, all previous unsignaled sends on that QP also completed
+  uint32_t send_signal_counter_per_qp_[kMaxSrcDstQP] = {0};
+  uint32_t unsignaled_sends_per_qp_[kMaxSrcDstQP] = {0};
+  uint32_t unsignaled_sends_total_ = 0;
+
   std::chrono::time_point<std::chrono::high_resolution_clock> last_stat_;
   std::atomic<uint64_t> out_packets_ = 0;
   std::atomic<uint64_t> out_bytes_ = 0;
