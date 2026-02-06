@@ -318,8 +318,7 @@ static inline int util_rdma_modify_cq_attr(struct ibv_cq_ex* cq_ex,
   cq_attr.moderate.cq_count = cq_count;
   cq_attr.moderate.cq_period = cq_period;
 
-  //return ibv_modify_cq(ibv_cq_ex_to_cq(cq_ex), &cq_attr);
-  return 0;
+  return ibv_modify_cq(ibv_cq_ex_to_cq(cq_ex), &cq_attr);
 }
 
 /**
