@@ -1222,7 +1222,7 @@ private:
         }
         barrier();
 
-        kernelScatteredMemcpy(ncclShmem.groups[group].cur_iovs);
+        kernelScatteredMemcpy(cur_iov_shmem);
 
         // Yang: debuging
         // if (tid == 0) {
@@ -1364,7 +1364,7 @@ private:
         }
         barrier();
 
-        kernelScatteredMemcpy(ncclShmem.groups[group].cur_iovs);
+        kernelScatteredMemcpy(cur_iov_shmem);
 
         // Yang: debuging
         // if (tid == 0) {
