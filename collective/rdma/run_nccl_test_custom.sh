@@ -104,7 +104,6 @@ mpirun --allow-run-as-root -np ${NUM_PROCS} -N ${PROCS_PER_NODE} \
     -x NCCL_NET_PLUGIN=${PLUGIN_PATH} \
     -x GLOG_v=0 \
     -x UCCL_DEBUG=WARN \
-    -x UCCL_PORT_ENTROPY=256 \
     -x UCCL_NUM_ENGINES=4 \
     --mca btl tcp,self \
     --mca btl_tcp_if_include ${CTRL_NIC} \
