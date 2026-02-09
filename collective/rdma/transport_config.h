@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 // #define STATS
-#define INTEL_RDMA_NIC
+// #define INTEL_RDMA_NIC
 
 // Whether to pin the thread to the NUMA node.
 UCCL_PARAM(PIN_TO_NUMA, "PIN_TO_NUMA", 1);
