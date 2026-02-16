@@ -16,11 +16,13 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <regex>
 #include <sstream>
@@ -150,7 +152,67 @@ ibv_mr* reg_mr_gpu_dmabuf(ibv_pd* pd, void* gpu_buf, size_t bytes,
           mr->addr, bytes, mr->rkey);
   return mr;
 }
+
+// ---------------------------------------------------------------------------
+// Shared RDMA resources cache
+// When multiple proxy threads select the same NIC for the same GPU buffer,
+// share a single ibv_context / pd / mr to avoid duplicate DMA-BUF IOMMU
+// mappings.  Each NIC can only handle one set of IOMMU page tables for
+// a given GPU buffer; registering the same 64+ GB buffer N times causes
+// ENOMEM on irdma (and wastes resources on any provider).
+//
+// The cache is keyed by (NIC device name, gpu_buf pointer).  A refcount
+// tracks how many ProxyCtx instances share the resources.  The last one
+// to call release_shared_rdma_resources() does the actual ibv_dereg/dealloc/
+// close.
+// ---------------------------------------------------------------------------
+struct SharedRdmaEntry {
+  ibv_context* context = nullptr;
+  ibv_pd* pd = nullptr;
+  ibv_mr* mr = nullptr;
+  uint32_t rkey = 0;
+  int numa_node = 0;
+  int refcount = 0;
+  bool ready = false;  // true once MR registration is complete
+};
+
+using SharedRdmaKey = std::pair<std::string, void*>;  // (nic_name, gpu_buf)
+
+static std::mutex g_shared_rdma_mu;
+static std::condition_variable g_shared_rdma_cv;
+static std::map<SharedRdmaKey, SharedRdmaEntry> g_shared_rdma_cache;
 #endif  // USE_DMABUF
+
+// Release shared RDMA resources (context/pd/mr) for a given NIC + gpu_buf.
+// Only the last holder actually frees them.  Safe to call even when sharing
+// is not active (no-op when the key is not found).
+void release_shared_rdma_resources(ProxyCtx& ctx, void* gpu_buf) {
+#ifdef USE_DMABUF
+  // We need to find which cache entry (if any) owns this context.
+  std::lock_guard<std::mutex> lock(g_shared_rdma_mu);
+  for (auto it = g_shared_rdma_cache.begin();
+       it != g_shared_rdma_cache.end(); ++it) {
+    if (it->first.second == gpu_buf && it->second.context == ctx.context) {
+      it->second.refcount--;
+      if (it->second.refcount <= 0) {
+        // Last holder — actually free.  Caller should still do dereg/dealloc/
+        // close in their normal cleanup path, so we just erase the entry.
+        g_shared_rdma_cache.erase(it);
+        return;  // let caller free
+      }
+      // Not the last holder — prevent caller from freeing shared objects.
+      ctx.mr = nullptr;
+      ctx.pd = nullptr;
+      ctx.context = nullptr;
+      return;
+    }
+  }
+  // Not in cache (single-NIC path or already released) — caller frees normally.
+#else
+  (void)ctx;
+  (void)gpu_buf;
+#endif
+}
 
 void recv_connection_info_as_server(int my_rank, int* actual_peer,
                                     int listen_fd,
@@ -330,6 +392,38 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
     std::abort();
   }
 
+#ifdef USE_DMABUF
+  // Check if another thread already opened this NIC for the same GPU buffer.
+  // If so, share the ibv_context / pd / mr to avoid duplicate IOMMU mappings.
+  // Use a placeholder + condvar to handle the race where multiple threads
+  // check the cache before the first thread finishes MR registration.
+  {
+    std::unique_lock<std::mutex> lock(g_shared_rdma_mu);
+    SharedRdmaKey key{selected_nic_name, gpu_buf};
+    auto it = g_shared_rdma_cache.find(key);
+    if (it != g_shared_rdma_cache.end()) {
+      // Entry exists — wait for the first thread to finish registration.
+      auto& entry = it->second;
+      g_shared_rdma_cv.wait(lock, [&entry] { return entry.ready; });
+      // Ready — reuse existing resources.
+      S.context = entry.context;
+      S.pd = entry.pd;
+      S.mr = entry.mr;
+      S.rkey = entry.rkey;
+      S.numa_node = entry.numa_node;
+      entry.refcount++;
+      printf("[RDMA] Thread %d sharing NIC %s context with %d other thread(s) "
+             "for GPU %d\n",
+             thread_idx, selected_nic_name.c_str(), entry.refcount - 1,
+             gpu_idx);
+      ibv_free_device_list(dev_list);
+      return;
+    }
+    // No entry — insert a placeholder so other threads will wait on us.
+    g_shared_rdma_cache[key] = {};  // ready=false
+  }
+#endif
+
   S.context = ibv_open_device(dev_list[selected_dev_idx]);
   if (!S.context) {
     perror("Failed to open device");
@@ -370,6 +464,23 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
   }
 
   S.rkey = S.mr->rkey;
+
+#ifdef USE_DMABUF
+  // Update the placeholder entry with real values and wake waiting threads.
+  {
+    std::lock_guard<std::mutex> lock(g_shared_rdma_mu);
+    SharedRdmaKey key{selected_nic_name, gpu_buf};
+    auto& entry = g_shared_rdma_cache[key];
+    entry.context = S.context;
+    entry.pd = S.pd;
+    entry.mr = S.mr;
+    entry.rkey = S.rkey;
+    entry.numa_node = S.numa_node;
+    entry.refcount = 1;
+    entry.ready = true;
+  }
+  g_shared_rdma_cv.notify_all();
+#endif
 }
 
 ibv_cq* create_per_thread_cq(ProxyCtx& S) {
