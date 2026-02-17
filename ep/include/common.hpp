@@ -37,6 +37,11 @@ extern bool use_ll_sl;
 // Use DMA-BUF for GPU memory registration (avoids nvidia_peermem dependency).
 // Falls back to ibv_reg_mr_iova2 at runtime if DMA-BUF is unsupported.
 #define USE_DMABUF
+// Maximum size for a single DMA-BUF MR registration.  The irdma kernel
+// driver has an internal ~2 GiB limit per ibv_reg_dmabuf_mr call; larger
+// buffers are automatically split into chunks of this size.
+static constexpr size_t kMaxDmabufChunkSize = 1ULL << 30;  // 1 GiB
+static constexpr int kMaxMRChunks = 128;
 // Use pinned host memory for the atomic buffer instead of cudaMalloc.
 // Required for NICs without nvidia_peermem (e.g. Intel irdma) so that
 // ibv_reg_mr succeeds, and allows CPU proxy threads to do std::atomic ops.

@@ -40,6 +40,18 @@ struct RDMAConnectionInfo {
   uint32_t num_rings;
   uint32_t data_qp_num[kChannelPerProxy];
   // #endif
+
+#ifdef USE_DMABUF
+  // Chunked MR info — exchanged when the GPU buffer is split across
+  // multiple MRs (irdma DMA-BUF 2 GiB limit).  num_mr_chunks == 0 means
+  // a single MR whose rkey is in the |rkey| field above.
+  uint32_t num_mr_chunks = 0;
+  struct {
+    uint32_t rkey;
+    uintptr_t addr;
+    uint64_t len;
+  } mr_chunk_info[kMaxMRChunks];
+#endif
 };
 
 struct PendingUpdate {
@@ -364,6 +376,12 @@ void release_shared_rdma_resources(ProxyCtx& ctx, void* gpu_buf);
 // Falls back to ibv_reg_mr_iova2 if DMA-BUF is unsupported.
 ibv_mr* reg_mr_gpu_dmabuf(ibv_pd* pd, void* gpu_buf, size_t bytes,
                           uint64_t iova, int access);
+
+// Register GPU memory in multiple DMA-BUF chunks when a single registration
+// exceeds the driver limit (irdma ~2 GiB per-MR limit).
+std::vector<MRChunk> reg_mr_gpu_dmabuf_chunked(
+    ibv_pd* pd, void* gpu_buf, size_t bytes, uint64_t iova, int access,
+    size_t max_chunk_size);
 #endif
 
 void remote_send_ack(ProxyCtx* ctx, struct ibv_qp* ack_qp, uint64_t& wr_id,

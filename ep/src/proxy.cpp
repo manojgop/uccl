@@ -255,6 +255,7 @@ void Proxy::init_common() {
     c.pd = ctx_.pd;
     c.mr = ctx_.mr;
     c.rkey = ctx_.rkey;
+    c.gpu_mr_chunks = ctx_.gpu_mr_chunks;
     // NOTE(MaoZiming): each context can share the same cq, pd, mr.
     // but the qp must be different.
     c.cq = ctx_.cq;
@@ -336,6 +337,33 @@ void Proxy::init_common() {
     c.remote_addr = remote_infos_[peer].addr;
     c.remote_rkey = remote_infos_[peer].rkey;
     c.remote_len = remote_infos_[peer].len;
+
+#ifdef USE_DMABUF
+    // Populate remote MR chunks from exchanged connection info.
+    if (remote_infos_[peer].num_mr_chunks > 0) {
+      c.remote_mr_chunks.resize(remote_infos_[peer].num_mr_chunks);
+      for (uint32_t ci = 0; ci < remote_infos_[peer].num_mr_chunks; ++ci) {
+        c.remote_mr_chunks[ci] = {
+            remote_infos_[peer].mr_chunk_info[ci].addr,
+            remote_infos_[peer].mr_chunk_info[ci].len,
+            remote_infos_[peer].mr_chunk_info[ci].rkey};
+      }
+      if (cfg_.thread_idx == 0) {
+        fprintf(stderr, "[Proxy] Received %u remote MR chunks from peer %d:\n",
+                remote_infos_[peer].num_mr_chunks, peer);
+        for (uint32_t ci = 0; ci < remote_infos_[peer].num_mr_chunks; ++ci) {
+          fprintf(stderr, "  [%u] base=0x%llx len=%zu rkey=0x%x\n",
+                  ci, (unsigned long long)c.remote_mr_chunks[ci].base,
+                  c.remote_mr_chunks[ci].len, c.remote_mr_chunks[ci].rkey);
+        }
+      }
+    } else {
+      if (cfg_.thread_idx == 0) {
+        fprintf(stderr, "[Proxy] Peer %d has num_mr_chunks=0 (single MR: rkey=0x%x)\n",
+                peer, remote_infos_[peer].rkey);
+      }
+    }
+#endif
 
     // Set remote atomic buffer info from exchanged connection info
     c.remote_atomic_buffer_addr = remote_infos_[peer].atomic_buffer_addr;
@@ -1073,7 +1101,14 @@ void Proxy::destroy(bool free_gpu_buffer) {
   // pointers so the dereg/dealloc/close below become no-ops.
   release_shared_rdma_resources(ctx_, cfg_.gpu_buffer);
 
-  dereg(ctx_.mr);
+  // Deregister all GPU buffer MR chunks (or the single MR).
+  if (!ctx_.gpu_mr_chunks.empty()) {
+    for (auto& c : ctx_.gpu_mr_chunks) dereg(c.mr);
+    ctx_.gpu_mr_chunks.clear();
+    ctx_.mr = nullptr;  // already deregistered as part of chunks
+  } else {
+    dereg(ctx_.mr);
+  }
 
   if (ctx_.atomic_old_values_buf) {
     free(ctx_.atomic_old_values_buf);
