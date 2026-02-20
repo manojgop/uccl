@@ -58,8 +58,10 @@ __device__ __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     TransferCmd cmd{};
     cmd.cmd_type =
         make_cmd_type(CmdType::WRITE, is_combine, low_latency_buffer_idx);
-    cmd.req_rptr = rptr_val;
-    cmd.req_lptr = lptr_val;
+    // Store offsets shifted right by kWriteAddrShift (all WRITE offsets are
+    // 16-byte aligned) to support RDMA buffers larger than 4 GiB.
+    cmd.req_rptr = rptr_val >> kWriteAddrShift;
+    cmd.req_lptr = lptr_val >> kWriteAddrShift;
     cmd.bytes = bytes_val;
     cmd.dst_rank = dst_rank;
     if constexpr (use_normal_mode) {
@@ -89,8 +91,10 @@ __device__ __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
       // NOTE(MaoZiming): cmd is needed for proxy to process the command.
       cmd.cmd_type =
           make_cmd_type(CmdType::WRITE, is_combine, low_latency_buffer_idx);
-      cmd.req_rptr = rptr_val;
-      cmd.req_lptr = lptr_val;
+      // Store offsets shifted right by kWriteAddrShift (all WRITE offsets are
+      // 16-byte aligned) to support RDMA buffers larger than 4 GiB.
+      cmd.req_rptr = rptr_val >> kWriteAddrShift;
+      cmd.req_lptr = lptr_val >> kWriteAddrShift;
       cmd.bytes = bytes_val;
       cmd.dst_rank = dst_rank;
       if (bytes_val >> 24) {
