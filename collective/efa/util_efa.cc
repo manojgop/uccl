@@ -10,6 +10,127 @@
 
 namespace uccl {
 
+#ifdef USE_DMABUF
+// ---------------------------------------------------------------------------
+// DMA-BUF based GPU memory registration (avoids nvidia_peermem dependency)
+// Requires CUDA >= 11.7 (driver API) and kernel DMA-BUF support.
+// Falls back to ibv_reg_mr when DMA-BUF is unavailable.
+//
+// We export a DMA-BUF fd covering [gpu_buf, gpu_buf + export_size) where
+// export_size is `bytes` rounded up to the GPU page granularity (2 MiB).
+// cuMemGetHandleForAddressRange requires this alignment.
+// On irdma, the driver processes the full scatter-gather list of the fd,
+// so we keep the export as small as possible (never the entire allocation).
+// ---------------------------------------------------------------------------
+
+// GPU page granularity for cuMemGetHandleForAddressRange DMA-BUF export.
+// On modern NVIDIA GPUs (Hopper, Ada, etc.) this is 2 MiB.
+static constexpr size_t kDmabufGranularity = 2ULL << 20;  // 2 MiB
+
+ibv_mr* reg_mr_gpu_dmabuf(ibv_pd* pd, void* gpu_buf, size_t bytes,
+                           uint64_t iova, int access) {
+  // Load CUDA Driver API functions via dlsym at runtime for forward
+  // compatibility and to avoid hard dependency on specific driver versions.
+  typedef CUresult (*cuMemGetAddressRange_t)(CUdeviceptr*, size_t*,
+                                             CUdeviceptr);
+  typedef CUresult (*cuMemGetHandleForAddressRange_t)(
+      int*, CUdeviceptr, size_t, CUmemRangeHandleType, unsigned long long);
+
+  static cuMemGetAddressRange_t cuMemGetAddressRange_func = nullptr;
+  static cuMemGetHandleForAddressRange_t
+      cuMemGetHandleForAddressRange_func = nullptr;
+  static std::once_flag init_flag;
+
+  std::call_once(init_flag, []() {
+    // Try the real driver library first, then fall back to unversioned name.
+    void* handle = dlopen("libcuda.so.1", RTLD_LAZY);
+    if (!handle) handle = dlopen("libcuda.so", RTLD_LAZY);
+    if (handle) {
+      cuMemGetAddressRange_func =
+          (cuMemGetAddressRange_t)dlsym(handle, "cuMemGetAddressRange_v2");
+      cuMemGetHandleForAddressRange_func =
+          (cuMemGetHandleForAddressRange_t)dlsym(
+              handle, "cuMemGetHandleForAddressRange");
+      // Don't dlclose — keep the library mapped so function pointers stay
+      // valid.
+    }
+  });
+
+  if (!cuMemGetAddressRange_func || !cuMemGetHandleForAddressRange_func) {
+    LOG(WARNING)
+        << "[EFA] CUDA Driver API functions not available (requires CUDA "
+           "11.7+), falling back to ibv_reg_mr";
+    return ibv_reg_mr(pd, gpu_buf, bytes, access);
+  }
+
+  // Get the actual CUDA allocation bounds.  cudaMalloc rounds up to GPU page
+  // granularity, so alloc_size is always properly aligned.  We use this to
+  // cap our rounded-up export size so we never exceed the allocation.
+  CUdeviceptr alloc_base = 0;
+  size_t alloc_size = 0;
+  CUresult cu_err = cuMemGetAddressRange_func(&alloc_base, &alloc_size,
+                                               (CUdeviceptr)gpu_buf);
+  if (cu_err != CUDA_SUCCESS) {
+    LOG(WARNING)
+        << "[EFA] cuMemGetAddressRange failed (CUresult=" << (int)cu_err
+        << "), falling back to ibv_reg_mr";
+    return ibv_reg_mr(pd, gpu_buf, bytes, access);
+  }
+
+  // cuMemGetHandleForAddressRange requires the size to be aligned to the GPU
+  // page granularity.  Round up, but cap at the CUDA allocation boundary.
+  size_t max_export =
+      (uintptr_t)alloc_base + alloc_size - (uintptr_t)gpu_buf;
+  size_t export_size =
+      ((bytes + kDmabufGranularity - 1) / kDmabufGranularity) *
+      kDmabufGranularity;
+  if (export_size > max_export) export_size = max_export;
+
+  LOG(INFO) << "[EFA] DMA-BUF: gpu_buf=" << gpu_buf << " bytes=" << bytes
+            << " export_size=" << export_size << " ("
+            << export_size / (1024.0 * 1024.0 * 1024.0) << " GiB)";
+
+  // Export DMA-BUF fd for the aligned region.
+  int dmabuf_fd = -1;
+  cu_err = cuMemGetHandleForAddressRange_func(
+      &dmabuf_fd, (CUdeviceptr)gpu_buf, export_size,
+      CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+
+  if (cu_err != CUDA_SUCCESS) {
+    LOG(WARNING) << "[EFA] cuMemGetHandleForAddressRange failed (CUresult="
+                 << (int)cu_err << "), falling back to ibv_reg_mr";
+    return ibv_reg_mr(pd, gpu_buf, bytes, access);
+  }
+
+  // Register only the actual bytes needed (fd covers export_size >= bytes).
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, /*fd_offset=*/0, bytes, iova,
+                                  dmabuf_fd, access);
+  if (!mr) {
+    // Return NULL so the caller can try chunked DMA-BUF registration
+    // (irdma has a ~2 GiB per-MR limit that chunking can work around).
+    LOG(WARNING) << "[EFA] ibv_reg_dmabuf_mr failed (errno=" << errno << ": "
+                 << strerror(errno) << "), will try chunked registration";
+    close(dmabuf_fd);
+    return nullptr;
+  }
+
+  close(dmabuf_fd);  // fd can be closed after registration
+
+  // irdma (and possibly other providers) leave mr->addr as NULL for dmabuf
+  // MRs.  All downstream code uses mr->addr as the base for SGE addresses,
+  // so we must patch it to the iova (== GPU virtual address).
+  if (!mr->addr) {
+    mr->addr = reinterpret_cast<void*>(iova);
+  }
+
+  LOG(INFO) << "[EFA] Registered GPU memory via DMA-BUF (addr=" << mr->addr
+            << ", len=" << bytes << ", lkey=0x" << std::hex << mr->lkey
+            << ") — no nvidia_peermem needed";
+  return mr;
+}
+#endif  // USE_DMABUF
+
+
 static std::vector<std::string> g_efa_device_names;
 static std::vector<std::string> g_ena_device_names;
 static std::once_flag g_devname_once;
@@ -382,6 +503,14 @@ EFASocket::EFASocket(int gpu_idx, int dev_idx, int socket_idx)
                  PktDataBuffPool::kNumPktData * PktDataBuffPool::kPktDataSize,
                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                      IBV_ACCESS_REMOTE_READ);
+#elif defined(USE_DMABUF)
+  // Use DMA-BUF to register GPU memory without nvidia_peermem.
+  auto pkt_data_size =
+      PktDataBuffPool::kNumPktData * PktDataBuffPool::kPktDataSize;
+  auto* pkt_data_mr_ = reg_mr_gpu_dmabuf(
+      pd_, pkt_data_buf_, pkt_data_size,
+      (uint64_t)pkt_data_buf_, IBV_ACCESS_LOCAL_WRITE);
+  CHECK(pkt_data_mr_ != nullptr) << "DMA-BUF registration failed for pkt_data_buf_";
 #else
   auto* pkt_data_mr_ =
       ibv_reg_mr(pd_, pkt_data_buf_,

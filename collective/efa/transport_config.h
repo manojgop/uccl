@@ -35,11 +35,8 @@ static_assert(
 // #define INTEL_RDMA_NIC
 
 #ifdef INTEL_RDMA_NIC
-#define MANAGED
-#endif
-
-#ifdef INTEL_RDMA_NIC
-#define MANAGED            // Use cudaMallocManaged not cudaMalloc
+#define MANAGED            // Use cudaMallocManaged for internal pkt_data_buf_
+#define USE_DMABUF          // Use DMA-BUF for user buffer registration (uccl_regmr)
 #endif
 
 #ifdef INTEL_RDMA_NIC

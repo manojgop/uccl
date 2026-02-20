@@ -24,6 +24,10 @@
 #include <vector>
 #include <assert.h>
 #include <cuda_runtime.h>
+#ifdef USE_DMABUF
+#include <cuda.h>
+#include <dlfcn.h>
+#endif
 #include <errno.h>
 #include <ifaddrs.h>
 #include <inttypes.h>
@@ -38,6 +42,13 @@
 #include <unistd.h>
 
 namespace uccl {
+
+#ifdef USE_DMABUF
+// Register GPU memory via DMA-BUF (single registration).
+// Returns the ibv_mr* on success, or nullptr (falls back to ibv_reg_mr).
+ibv_mr* reg_mr_gpu_dmabuf(ibv_pd* pd, void* gpu_buf, size_t bytes,
+                          uint64_t iova, int access);
+#endif  // USE_DMABUF
 
 class PktHdrBuffPool : public BuffPool {
  public:

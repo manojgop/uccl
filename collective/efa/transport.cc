@@ -2231,8 +2231,28 @@ int Endpoint::uccl_regmr(int dev, void* addr, size_t len,
 #endif
 
   *mhandle = new Mhandle();
+
+#ifdef USE_DMABUF
+  // Check if this is GPU memory; if so, use DMA-BUF registration.
+  cudaPointerAttributes attributes;
+  cudaError_t cuda_err = cudaPointerGetAttributes(&attributes, addr);
+  bool is_gpu_memory = (cuda_err == cudaSuccess &&
+                        attributes.type == cudaMemoryTypeDevice);
+
+  if (is_gpu_memory) {
+    (*mhandle)->mr = reg_mr_gpu_dmabuf(
+        factory_dev->pd, addr, len, (uint64_t)addr, IBV_ACCESS_LOCAL_WRITE);
+  }
+
+  // Fall through: host memory or DMA-BUF succeeded with single MR.
+  if (!(*mhandle)->mr) {
+    (*mhandle)->mr =
+        ibv_reg_mr(factory_dev->pd, addr, len, IBV_ACCESS_LOCAL_WRITE);
+  }
+#else
   (*mhandle)->mr =
       ibv_reg_mr(factory_dev->pd, addr, len, IBV_ACCESS_LOCAL_WRITE);
+#endif
 
   return 0;
 }
